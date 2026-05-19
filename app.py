@@ -312,23 +312,22 @@ else:
         # Canvas sizing — max 700px wide, maintain aspect ratio
         CANVAS_W = min(700, m_w) if m_w > 0 else 700
         CANVAS_H = int(m_h * CANVAS_W / m_w) if m_w > 0 else 400
+        _, buf = cv2.imencode(".jpg", first_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        b64_frame = base64.b64encode(buf.tobytes()).decode()
+        bg_url = f"data:image/jpeg;base64,{b64_frame}"
 
-        frame_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
-        pil_img   = Image.fromarray(frame_rgb).resize((CANVAS_W, CANVAS_H))
-
-        # ── Drawable canvas — coordinates come back directly to Python ────────
         canvas_result = st_canvas(
             fill_color   = "rgba(245, 158, 11, 0.15)",
             stroke_width = 2,
             stroke_color = "#f59e0b",
-            background_image  = pil_img,
-            update_streamlit  = True,
+            background_url   = bg_url,
+            update_streamlit = True,
             width        = CANVAS_W,
             height       = CANVAS_H,
             drawing_mode = "rect",
             key          = "roi_canvas",
         )
-
+        
         # ── Read coordinates from canvas result into pending_roi ──────────────
         pending_roi = None
         if (
