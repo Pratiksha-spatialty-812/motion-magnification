@@ -4,7 +4,6 @@ import cv2
 import tempfile
 import os
 import time
-import json
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -191,88 +190,6 @@ def make_plot(result: dict) -> plt.Figure:
     return fig
 
 
-ROI_PICKER_HTML = """
-<style>
-  body {{ margin:0; background:#0d0d18; }}
-  #canvas-wrap {{ position:relative; display:inline-block; }}
-  canvas {{ display:block; cursor:crosshair; border:2px solid #1e1e30; border-radius:8px; }}
-  #info {{ font-family:'Space Mono',monospace; font-size:0.72rem; color:#6b7280; margin:6px 0 4px; }}
-  #roi-out {{ font-family:'Space Mono',monospace; font-size:0.78rem; color:#38bdf8;
-              background:#13131f; border:1px solid #1e1e30; border-radius:6px;
-              padding:6px 10px; margin-top:4px; min-height:22px; }}
-  button {{
-    margin-top:8px; background:linear-gradient(135deg,#7c3aed,#2563eb);
-    color:#fff; border:none; border-radius:8px; font-family:'Syne',sans-serif;
-    font-weight:600; font-size:0.9rem; padding:6px 22px; cursor:pointer;
-  }}
-  button:hover {{ opacity:0.85; }}
-</style>
-<div id="canvas-wrap">
-  <canvas id="c" width="{CW}" height="{CH}"></canvas>
-</div>
-<div id="info">Click and drag to draw the ROI rectangle on the frame above.</div>
-<div id="roi-out">No ROI selected yet.</div>
-<button onclick="confirmROI()">✅ Confirm ROI</button>
-
-<script>
-const canvas = document.getElementById('c');
-const ctx = canvas.getContext('2d');
-const img = new Image();
-img.onload = () => {{ ctx.drawImage(img, 0, 0, canvas.width, canvas.height); }};
-img.src = 'data:image/jpeg;base64,{B64}';
-
-// scale factors from display → actual video pixels
-const scaleX = {VW} / canvas.width;
-const scaleY = {VH} / canvas.height;
-
-let drawing = false, startX=0, startY=0, rect={{x:0,y:0,w:0,h:0}};
-
-canvas.addEventListener('mousedown', e => {{
-  const r = canvas.getBoundingClientRect();
-  startX = e.clientX - r.left;
-  startY = e.clientY - r.top;
-  drawing = true;
-}});
-canvas.addEventListener('mousemove', e => {{
-  if (!drawing) return;
-  const r = canvas.getBoundingClientRect();
-  const cx = e.clientX - r.left;
-  const cy = e.clientY - r.top;
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]);
-  ctx.strokeRect(startX, startY, cx-startX, cy-startY);
-  ctx.fillStyle='rgba(245,158,11,0.08)';
-  ctx.fillRect(startX, startY, cx-startX, cy-startY);
-}});
-canvas.addEventListener('mouseup', e => {{
-  if (!drawing) return;
-  drawing = false;
-  const r = canvas.getBoundingClientRect();
-  const ex = e.clientX - r.left;
-  const ey = e.clientY - r.top;
-  rect = {{
-    x: Math.round(Math.min(startX,ex)*scaleX),
-    y: Math.round(Math.min(startY,ey)*scaleY),
-    w: Math.round(Math.abs(ex-startX)*scaleX),
-    h: Math.round(Math.abs(ey-startY)*scaleY)
-  }};
-  document.getElementById('roi-out').innerText =
-    `ROI → x:${{rect.x}}  y:${{rect.y}}  w:${{rect.w}}  h:${{rect.h}}  (video pixels)`;
-}});
-
-function confirmROI() {{
-  if (rect.w < 4 || rect.h < 4) {{
-    alert('Please draw a larger ROI first.');
-    return;
-  }}
-  window.parent.postMessage({{type:'roi', data: rect}}, '*');
-  document.getElementById('roi-out').innerText =
-    '✅ Sent to app — x:' + rect.x + '  y:' + rect.y + '  w:' + rect.w + '  h:' + rect.h;
-}}
-</script>
-"""
-
 
 # ── Main layout ────────────────────────────────────────────────────────────────
 left_col, right_col = st.columns([1, 1], gap="large")
@@ -406,127 +323,263 @@ with right_col:
 # ── Vibration Analysis Section ─────────────────────────────────────────────────
 st.markdown("---")
 st.markdown("## 🌊 Vibration Analysis")
+st.markdown(
+    "Draw a bounding box on the first frame to define your region of interest. "
+    "Optical flow is computed inside that region across every frame of the **original video**, "
+    "then FFT reveals the dominant vibration frequency."
+)
 
 if not uploaded_file or tmp_input_path is None:
-    st.info("Upload a video above to use the vibration analysis tools.")
+    st.info("Upload a video above to enable vibration analysis.")
 else:
-    import base64
+    import base64, io
 
-    # Extract first frame for ROI picker
+    # ── Extract first frame ────────────────────────────────────────────────────
     cap_roi = cv2.VideoCapture(tmp_input_path)
     ret_roi, first_frame = cap_roi.read()
     cap_roi.release()
 
-    if ret_roi:
-        # Encode first frame as JPEG → base64 for the canvas picker
-        CANVAS_W = 640
+    if not ret_roi:
+        st.warning("Could not read first frame for ROI selection.")
+    else:
+        CANVAS_W = min(720, vid_w)
         CANVAS_H = int(vid_h * CANVAS_W / vid_w) if vid_w > 0 else 360
-        _, buf = cv2.imencode(".jpg", first_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        _, buf = cv2.imencode(".jpg", first_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
         b64_frame = base64.b64encode(buf.tobytes()).decode()
 
-        st.markdown("### 🖼️ Draw ROI on First Frame")
-        st.markdown(
-            "Click and drag on the frame below to select the region of interest "
-            "for vibration analysis, then click **Confirm ROI**."
-        )
+        # ── ROI state stored in session_state["roi_coords"] as "x,y,w,h" ──────
+        if "roi_coords" not in st.session_state:
+            st.session_state["roi_coords"] = ""
 
-        # Render the interactive canvas picker inside an iframe
-        html_code = ROI_PICKER_HTML.format(
-            CW=CANVAS_W, CH=CANVAS_H,
-            B64=b64_frame,
-            VW=vid_w, VH=vid_h,
-        )
+        # Hidden text_input that JS writes into via DOM manipulation
+        # We render it visually hidden with CSS
+        st.markdown("""
+<style>
+div[data-testid="stTextInput"]:has(input[aria-label="__roi_hidden__"]) {
+    position: absolute; opacity: 0; pointer-events: none; height: 0; overflow: hidden;
+}
+</style>""", unsafe_allow_html=True)
 
-        # We use a listener via st.components; the postMessage is caught by a
-        # small JS bridge that writes into a hidden text_input via the DOM.
-        # Simpler approach: use a form with manual coordinate entry as fallback.
-        components.html(html_code, height=CANVAS_H + 120, scrolling=False)
+        roi_hidden = st.text_input("__roi_hidden__", key="roi_coords", label_visibility="hidden")
 
-        st.markdown("#### Or enter ROI coordinates manually")
-        col_x, col_y, col_w, col_h = st.columns(4)
-        with col_x:
-            roi_x = st.number_input("X (px)", 0, vid_w - 1, 0, key="roi_x")
-        with col_y:
-            roi_y = st.number_input("Y (px)", 0, vid_h - 1, 0, key="roi_y")
-        with col_w:
-            roi_w = st.number_input("Width (px)", 4, vid_w, min(vid_w, 200), key="roi_w")
-        with col_h:
-            roi_h = st.number_input("Height (px)", 4, vid_h, min(vid_h, 200), key="roi_h")
+        # ── Canvas ROI picker ──────────────────────────────────────────────────
+        CANVAS_HTML = f"""
+<style>
+  body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; }}
+  #wrap {{ position:relative; display:inline-block; width:100%; }}
+  canvas {{ display:block; cursor:crosshair; border-radius:10px;
+            border:2px solid #1e1e30; width:100%; height:auto; }}
+  #hint  {{ font-size:0.72rem; color:#6b7280; margin: 6px 0 8px; }}
+  #roi-label {{ font-size:0.78rem; color:#38bdf8; background:#13131f;
+                border:1px solid #1e1e30; border-radius:6px;
+                padding:5px 10px; display:inline-block; min-width:260px;
+                margin-bottom:8px; }}
+  #confirm-btn {{
+    background:linear-gradient(135deg,#7c3aed,#2563eb);
+    color:#fff; border:none; border-radius:8px;
+    font-family:'Syne',sans-serif; font-weight:700; font-size:0.88rem;
+    padding:7px 26px; cursor:pointer; transition:opacity .2s;
+  }}
+  #confirm-btn:hover {{ opacity:0.82; }}
+  #confirm-btn.sent {{ background:linear-gradient(135deg,#059669,#0284c7); }}
+</style>
+<div id="wrap">
+  <canvas id="c" width="{CANVAS_W}" height="{CANVAS_H}"></canvas>
+</div>
+<div id="hint">Click and drag to draw ROI, then click Confirm.</div>
+<div id="roi-label">No ROI drawn yet</div><br>
+<button id="confirm-btn" onclick="confirmROI()">✅ Confirm ROI</button>
 
-        roi_tuple = (int(roi_x), int(roi_y), int(roi_w), int(roi_h))
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const img    = new Image();
+img.onload = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+img.src    = 'data:image/jpeg;base64,{b64_frame}';
 
-        # Preview ROI on frame
-        preview = first_frame.copy()
-        cv2.rectangle(preview,
-                      (roi_tuple[0], roi_tuple[1]),
-                      (roi_tuple[0] + roi_tuple[2], roi_tuple[1] + roi_tuple[3]),
-                      (245, 158, 11), 2)
-        preview_rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
-        st.image(preview_rgb, caption="ROI Preview (orange box)", use_container_width=True)
+const scaleX = {vid_w} / {CANVAS_W};
+const scaleY = {vid_h} / {CANVAS_H};
 
-        run_analysis = st.button("📊 Run Vibration Analysis", use_container_width=True)
+let drawing=false, sx=0, sy=0, rect={{x:0,y:0,w:0,h:0}}, confirmed=false;
 
-        if run_analysis:
-            st.markdown("---")
-            an_progress = st.progress(0)
-            an_status   = st.empty()
-            an_status.info("🔄 Computing optical flow…")
+function redraw(cx, cy) {{
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(img,0,0,canvas.width,canvas.height);
+  if (!drawing && confirmed) {{
+    // draw confirmed box
+    drawBox(rect.dx, rect.dy, rect.dw, rect.dh);
+    return;
+  }}
+  const dw = cx - sx, dh = cy - sy;
+  drawBox(sx, sy, dw, dh);
+}}
 
-            def an_callback(cur, tot):
-                an_progress.progress(cur / tot)
+function drawBox(x,y,w,h) {{
+  ctx.save();
+  ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([6,3]);
+  ctx.strokeRect(x,y,w,h);
+  ctx.fillStyle='rgba(245,158,11,0.10)';
+  ctx.fillRect(x,y,w,h);
+  ctx.restore();
+}}
 
+canvas.addEventListener('mousedown', e => {{
+  const r=canvas.getBoundingClientRect();
+  sx = (e.clientX-r.left)*(canvas.width/r.width);
+  sy = (e.clientY-r.top)*(canvas.height/r.height);
+  drawing=true; confirmed=false;
+}});
+canvas.addEventListener('mousemove', e => {{
+  if (!drawing) return;
+  const r=canvas.getBoundingClientRect();
+  const cx=(e.clientX-r.left)*(canvas.width/r.width);
+  const cy=(e.clientY-r.top)*(canvas.height/r.height);
+  redraw(cx,cy);
+  const vx=Math.round(Math.min(sx,cx)*scaleX);
+  const vy=Math.round(Math.min(sy,cy)*scaleY);
+  const vw=Math.round(Math.abs(cx-sx)*scaleX);
+  const vh=Math.round(Math.abs(cy-sy)*scaleY);
+  document.getElementById('roi-label').innerText =
+    'ROI → x:'+vx+' y:'+vy+' w:'+vw+' h:'+vh+' px';
+}});
+canvas.addEventListener('mouseup', e => {{
+  if (!drawing) return;
+  drawing=false;
+  const r=canvas.getBoundingClientRect();
+  const ex=(e.clientX-r.left)*(canvas.width/r.width);
+  const ey=(e.clientY-r.top)*(canvas.height/r.height);
+  rect = {{
+    dx:Math.min(sx,ex), dy:Math.min(sy,ey),
+    dw:Math.abs(ex-sx),  dh:Math.abs(ey-sy),
+    x:Math.round(Math.min(sx,ex)*scaleX),
+    y:Math.round(Math.min(sy,ey)*scaleY),
+    w:Math.round(Math.abs(ex-sx)*scaleX),
+    h:Math.round(Math.abs(ey-sy)*scaleY),
+  }};
+  confirmed=true;
+  redraw(ex,ey);
+}});
+
+function confirmROI() {{
+  if (!confirmed || rect.w < 4 || rect.h < 4) {{
+    alert('Please draw a larger ROI first.'); return;
+  }}
+  const val = rect.x+','+rect.y+','+rect.w+','+rect.h;
+  // Write into the hidden Streamlit text_input and fire React change event
+  const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+  for (const inp of inputs) {{
+    if (inp.getAttribute('aria-label') === '__roi_hidden__' ||
+        inp.closest('[data-testid="stTextInput"]')) {{
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype, 'value').set;
+      nativeInputValueSetter.call(inp, val);
+      inp.dispatchEvent(new Event('input', {{bubbles:true}}));
+      break;
+    }}
+  }}
+  const btn = document.getElementById('confirm-btn');
+  btn.classList.add('sent');
+  btn.innerText = '✅ ROI Confirmed — click Run Analysis';
+}}
+</script>
+"""
+        components.html(CANVAS_HTML, height=CANVAS_H + 110, scrolling=False)
+
+        # ── Parse confirmed ROI ────────────────────────────────────────────────
+        roi_tuple = None
+        raw = st.session_state.get("roi_coords", "").strip()
+        if raw:
             try:
-                result = analyze_vibration(
-                    input_path=tmp_input_path,
-                    roi=roi_tuple,
-                    fps=vid_fps if vid_fps > 0 else fps,
-                    method=of_method,
-                    progress_callback=an_callback,
-                )
-                an_progress.progress(1.0)
-                an_status.success("✅ Analysis complete!")
+                parts = [int(v) for v in raw.split(",")]
+                if len(parts) == 4 and parts[2] >= 4 and parts[3] >= 4:
+                    roi_tuple = tuple(parts)
+            except ValueError:
+                pass
 
-                # Metrics
-                st.markdown("#### 📈 Vibration Results")
-                r1, r2, r3, r4 = st.columns(4)
-                r1.metric("Dominant Freq", f"{result['dominant_hz']:.3f} Hz")
-                r2.metric("Period", f"{1/result['dominant_hz']:.3f} s" if result["dominant_hz"] > 0 else "—")
-                r3.metric("Amplitude", f"{result['dominant_amp']:.4f} px")
-                r4.metric("Frames analysed", str(len(result["motion"])))
+        if roi_tuple:
+            # Show a static preview with the confirmed box
+            preview = first_frame.copy()
+            cv2.rectangle(
+                preview,
+                (roi_tuple[0], roi_tuple[1]),
+                (roi_tuple[0] + roi_tuple[2], roi_tuple[1] + roi_tuple[3]),
+                (245, 158, 11), 2,
+            )
+            st.image(
+                cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+                caption=f"Confirmed ROI  x:{roi_tuple[0]} y:{roi_tuple[1]} "
+                        f"w:{roi_tuple[2]} h:{roi_tuple[3]}",
+                use_container_width=True,
+            )
 
-                # Plot
-                fig = make_plot(result)
-                st.pyplot(fig, use_container_width=True)
-                plt.close(fig)
+            run_analysis = st.button("📊 Run Vibration Analysis", use_container_width=True)
 
-                # Export CSV
-                import io
-                csv_buf = io.StringIO()
-                csv_buf.write("time_s,motion_px_per_frame\n")
-                for t, m in zip(result["times"], result["motion"]):
-                    csv_buf.write(f"{t:.6f},{m:.6f}\n")
-                st.download_button(
-                    "⬇️ Download Motion Signal (CSV)",
-                    data=csv_buf.getvalue(),
-                    file_name="motion_signal.csv",
-                    mime="text/csv",
-                )
+            if run_analysis:
+                an_status   = st.empty()
+                an_progress = st.progress(0)
+                an_status.info("🔄 Computing optical flow on original video…")
 
-                csv_fft = io.StringIO()
-                csv_fft.write("freq_hz,power\n")
-                for f, p in zip(result["freqs"], result["power"]):
-                    csv_fft.write(f"{f:.6f},{p:.6f}\n")
-                st.download_button(
-                    "⬇️ Download FFT Spectrum (CSV)",
-                    data=csv_fft.getvalue(),
-                    file_name="fft_spectrum.csv",
-                    mime="text/csv",
-                )
+                def an_callback(cur, tot):
+                    an_progress.progress(min(cur / tot, 1.0))
 
-            except Exception as e:
-                an_status.error(f"❌ Analysis error: {str(e)}")
-    else:
-        st.warning("Could not read first frame from video for ROI selection.")
+                try:
+                    result = analyze_vibration(
+                        input_path=tmp_input_path,
+                        roi=roi_tuple,
+                        fps=vid_fps if vid_fps > 0 else fps,
+                        method=of_method,
+                        progress_callback=an_callback,
+                    )
+                    an_progress.progress(1.0)
+                    an_status.success("✅ Analysis complete!")
+
+                    st.markdown("#### 📈 Vibration Results")
+                    r1, r2, r3, r4 = st.columns(4)
+                    r1.metric("Dominant Freq", f"{result['dominant_hz']:.3f} Hz")
+                    r2.metric(
+                        "Period",
+                        f"{1/result['dominant_hz']:.3f} s" if result["dominant_hz"] > 0 else "—",
+                    )
+                    r3.metric("Amplitude", f"{result['dominant_amp']:.4f} px")
+                    r4.metric("Frames analysed", str(len(result["motion"])))
+
+                    fig = make_plot(result)
+                    st.pyplot(fig, use_container_width=True)
+                    plt.close(fig)
+
+                    # CSV downloads
+                    csv_motion = io.StringIO()
+                    csv_motion.write("time_s,motion_px_per_frame\n")
+                    for t, m in zip(result["times"], result["motion"]):
+                        csv_motion.write(f"{t:.6f},{m:.6f}\n")
+
+                    csv_fft = io.StringIO()
+                    csv_fft.write("freq_hz,power\n")
+                    for f, p in zip(result["freqs"], result["power"]):
+                        csv_fft.write(f"{f:.6f},{p:.6f}\n")
+
+                    dl1, dl2 = st.columns(2)
+                    with dl1:
+                        st.download_button(
+                            "⬇️ Motion Signal (CSV)",
+                            data=csv_motion.getvalue(),
+                            file_name="motion_signal.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                    with dl2:
+                        st.download_button(
+                            "⬇️ FFT Spectrum (CSV)",
+                            data=csv_fft.getvalue(),
+                            file_name="fft_spectrum.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+
+                except Exception as e:
+                    an_status.error(f"❌ Analysis error: {str(e)}")
+        else:
+            st.info("Draw and confirm a ROI on the frame above, then click **Run Vibration Analysis**.")
 
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
