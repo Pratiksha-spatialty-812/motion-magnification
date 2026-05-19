@@ -4,3 +4,4 @@ scipy>=1.11.0
 pyrtools>=1.0.1
 opencv-python-headless>=4.8.0
 scikit-image>=0.21.0
+matplotlib>=3.7.0
