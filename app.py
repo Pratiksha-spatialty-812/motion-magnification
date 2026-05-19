@@ -64,8 +64,7 @@ hr { border-color: #1e1e30 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="main-title">🔬 Motion Magnification Lab</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-title">Eulerian Video Magnification · Laplacian Pyramid · Temporal Filtering · Vibration Analysis</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">🔬 Motion Magnification </div>', unsafe_allow_html=True)
 st.markdown("---")
 
 # ── Session state ──────────────────────────────────────────────────────────────
