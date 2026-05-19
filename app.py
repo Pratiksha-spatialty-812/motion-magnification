@@ -25,13 +25,10 @@ st.set_page_config(
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
-
 html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 .stApp { background-color: #0a0a0f; color: #e8e8f0; }
-
 [data-testid="stSidebar"] { background-color: #10101a !important; border-right: 1px solid #1e1e2e; }
 [data-testid="stSidebar"] * { color: #c8c8d8 !important; }
-
 .main-title {
     font-family: 'Syne', sans-serif; font-weight: 800; font-size: 2.6rem;
     background: linear-gradient(135deg, #a78bfa, #38bdf8, #34d399);
@@ -81,10 +78,6 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 }
 hr { border-color: #1e1e30 !important; }
 .stSuccess, .stInfo { border-radius: 10px !important; }
-/* hide the ROI bridge input */
-div[data-testid="stTextInput"]:has(input[aria-label="__roi_hidden__"]) {
-    position: absolute; opacity: 0; pointer-events: none; height: 0; overflow: hidden;
-}
 #MainMenu { visibility: hidden; } footer { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
@@ -94,14 +87,16 @@ st.markdown('<div class="main-title">🔬 Motion Magnification Lab</div>', unsaf
 st.markdown('<div class="sub-title">Eulerian Video Magnification · Laplacian Pyramid · Temporal Filtering · Vibration Analysis</div>', unsafe_allow_html=True)
 st.markdown("---")
 
-# ── Session state ──────────────────────────────────────────────────────────────
+# ── Session state init ─────────────────────────────────────────────────────────
 for key, default in [
-    ("magnified_path", None),
-    ("mag_vid_w",      0),
-    ("mag_vid_h",      0),
-    ("mag_vid_fps",    0.0),
-    ("roi_coords",     ""),
-    ("mag_bytes",      None),   # FIX 1: cache video bytes so player persists across reruns
+    ("magnified_path",   None),
+    ("original_bytes",   None),   # cached original video bytes
+    ("mag_bytes",        None),   # cached magnified video bytes
+    ("mag_vid_w",        0),
+    ("mag_vid_h",        0),
+    ("mag_vid_fps",      0.0),
+    ("confirmed_roi",    None),   # (x,y,w,h) stored here — never wiped by widget reconciliation
+    ("roi_input_val",    ""),     # bridge value written by JS
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -111,36 +106,26 @@ for key, default in [
 with st.sidebar:
     st.markdown("## ⚙️ Magnification Parameters")
     st.markdown("---")
-
     st.markdown('<div class="param-label">Alpha — Magnification Strength</div>', unsafe_allow_html=True)
     alpha = st.slider("Alpha", 10, 200, 100, 5)
-
     st.markdown('<div class="param-label">Lambda C — Spatial Wavelength (px)</div>', unsafe_allow_html=True)
     lambda_c = st.slider("Lambda C", 1, 100, 20, 1)
-
     st.markdown('<div class="param-label">fl — Low Frequency Cutoff (Hz)</div>', unsafe_allow_html=True)
     fl = st.slider("fl (Hz)", 0.1, 10.0, 1.0, 0.1)
-
     st.markdown('<div class="param-label">fh — High Frequency Cutoff (Hz)</div>', unsafe_allow_html=True)
     fh = st.slider("fh (Hz)", 1.0, 30.0, 14.0, 0.5)
-
     st.markdown('<div class="param-label">FPS — Video Frame Rate</div>', unsafe_allow_html=True)
     fps_sidebar = st.slider("FPS", 15, 60, 30, 1)
-
     st.markdown("---")
     st.markdown("### 🔺 Pyramid Settings")
-
     st.markdown('<div class="param-label">Pyramid Levels (0 = default)</div>', unsafe_allow_html=True)
     n_levels_raw = st.slider("Pyramid Levels", 0, 8, 0, 1)
     n_levels = None if n_levels_raw == 0 else n_levels_raw
-
     st.markdown('<div class="param-label">Alpha Curve</div>', unsafe_allow_html=True)
     alpha_curve = st.selectbox("Alpha Curve", list(ALPHA_CURVES.keys()), index=0)
-
     st.markdown("---")
     st.markdown("### 🌊 Vibration Analysis")
     of_method = st.selectbox("Optical Flow Method", ["farneback", "lucas_kanade"])
-
     st.markdown("---")
     st.markdown("""
 <div style='font-size:0.76rem; color:#6b7280; line-height:1.8;'>
@@ -162,21 +147,17 @@ def make_plot(result: dict) -> plt.Figure:
         ax.tick_params(colors="#9ca3af", labelsize=8)
         for spine in ax.spines.values():
             spine.set_edgecolor("#1e1e30")
-
     ax1.plot(result["times"], result["motion"], color="#38bdf8", lw=1.2)
     ax1.set_xlabel("Time (s)", color="#9ca3af", fontsize=8)
     ax1.set_ylabel("Mean Flow (px/frame)", color="#9ca3af", fontsize=8)
-    ax1.set_title("Optical-Flow Motion Signal — Magnified ROI",
-                  color="#e8e8f0", fontsize=10, fontweight="bold")
+    ax1.set_title("Optical-Flow Motion Signal — Magnified ROI", color="#e8e8f0", fontsize=10, fontweight="bold")
     ax1.xaxis.set_minor_locator(ticker.AutoMinorLocator())
     ax1.grid(color="#1e1e30", linestyle="--", linewidth=0.5, which="both")
-
     freqs, power = result["freqs"], result["power"]
     ax2.fill_between(freqs, power, alpha=0.3, color="#a78bfa")
     ax2.plot(freqs, power, color="#a78bfa", lw=1.2)
     dom = result["dominant_hz"]
-    ax2.axvline(dom, color="#f59e0b", lw=1.5, linestyle="--",
-                label=f"Peak: {dom:.3f} Hz")
+    ax2.axvline(dom, color="#f59e0b", lw=1.5, linestyle="--", label=f"Peak: {dom:.3f} Hz")
     ax2.set_xlabel("Frequency (Hz)", color="#9ca3af", fontsize=8)
     ax2.set_ylabel("Power", color="#9ca3af", fontsize=8)
     ax2.set_title("FFT Vibration Spectrum", color="#e8e8f0", fontsize=10, fontweight="bold")
@@ -186,34 +167,48 @@ def make_plot(result: dict) -> plt.Figure:
     return fig
 
 
-# ── Helper: canvas ROI picker ──────────────────────────────────────────────────
+# ── Helper: ROI canvas HTML ────────────────────────────────────────────────────
 def roi_canvas_html(b64_img: str, canvas_w: int, canvas_h: int,
-                    vid_w: int, vid_h: int) -> str:
-    """
-    FIX 2: canvas is always sized to exactly canvas_w × canvas_h pixels
-    (we pass a sane value ≤ 640).  CSS width:100% is removed so the canvas
-    never gets rescaled by the iframe, which broke the coordinate mapping.
-    Touch events are added for tablet/mobile support.
-    """
+                    vid_w: int, vid_h: int,
+                    existing_roi: tuple | None) -> str:
+    # Pre-populate box if ROI already confirmed
+    preload_js = ""
+    if existing_roi:
+        rx, ry, rw, rh = existing_roi
+        # Convert video coords → canvas coords
+        preload_js = f"""
+  window.addEventListener('load', function() {{
+    var sx = {rx} * NW / VW;
+    var sy = {ry} * NH / VH;
+    var ex = ({rx} + {rw}) * NW / VW;
+    var ey = ({ry} + {rh}) * NH / VH;
+    rect = {{ dx:sx, dy:sy, dw:ex-sx, dh:ey-sy,
+              x:{rx}, y:{ry}, w:{rw}, h:{rh} }};
+    confirmed = true;
+    ctx.drawImage(img, 0, 0, NW, NH);
+    drawBox(rect.dx, rect.dy, rect.dw, rect.dh);
+    document.getElementById('roi-label').innerText =
+      'ROI → x:{rx}  y:{ry}  w:{rw}  h:{rh} px';
+    var btn = document.getElementById('confirm-btn');
+    btn.classList.add('sent');
+    btn.innerText = '✅ ROI Confirmed — scroll down to run analysis';
+  }});
+"""
+
     return f"""
 <style>
   body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; overflow-x:hidden; }}
-  #wrap {{ width:{canvas_w}px; max-width:100%; }}
   canvas {{
     display:block;
     width:{canvas_w}px; height:{canvas_h}px;
     max-width:100%;
-    cursor:crosshair;
-    border-radius:10px;
-    border:2px solid #1e1e30;
-    box-sizing:border-box;
+    cursor:crosshair; border-radius:10px; border:2px solid #1e1e30; box-sizing:border-box;
   }}
   #hint {{ font-size:0.72rem; color:#6b7280; margin:6px 0 8px; }}
   #roi-label {{
     font-size:0.78rem; color:#38bdf8; background:#13131f;
-    border:1px solid #1e1e30; border-radius:6px;
-    padding:5px 10px; display:inline-block;
-    min-width:280px; margin-bottom:8px; word-break:break-all;
+    border:1px solid #1e1e30; border-radius:6px; padding:5px 10px;
+    display:inline-block; min-width:280px; margin-bottom:8px; word-break:break-all;
   }}
   #confirm-btn {{
     background:linear-gradient(135deg,#7c3aed,#2563eb); color:#fff;
@@ -224,20 +219,16 @@ def roi_canvas_html(b64_img: str, canvas_w: int, canvas_h: int,
   #confirm-btn:hover {{ opacity:0.82; }}
   #confirm-btn.sent {{ background:linear-gradient(135deg,#059669,#0284c7); }}
 </style>
-<div id="wrap">
-  <canvas id="c" width="{canvas_w}" height="{canvas_h}"></canvas>
-  <div id="hint">Click and drag to draw ROI on the magnified frame, then click Confirm.</div>
-  <div id="roi-label">No ROI drawn yet</div><br>
-  <button id="confirm-btn" onclick="confirmROI()">✅ Confirm ROI</button>
-</div>
+<canvas id="c" width="{canvas_w}" height="{canvas_h}"></canvas>
+<div id="hint">Click and drag to draw ROI, then click Confirm.</div>
+<div id="roi-label">No ROI drawn yet</div><br>
+<button id="confirm-btn" onclick="confirmROI()">✅ Confirm ROI</button>
+
 <script>
 const canvas = document.getElementById('c');
 const ctx    = canvas.getContext('2d');
-
-// Native canvas resolution (fixed, never changes)
 const NW = {canvas_w};
 const NH = {canvas_h};
-// Video resolution (for coordinate mapping)
 const VW = {vid_w};
 const VH = {vid_h};
 
@@ -245,121 +236,90 @@ const img = new Image();
 img.onload = () => ctx.drawImage(img, 0, 0, NW, NH);
 img.src    = 'data:image/jpeg;base64,{b64_img}';
 
-// Map a mouse/touch client position → canvas pixel coords
 function clientToCanvas(cx, cy) {{
   const r = canvas.getBoundingClientRect();
-  // CSS size may differ from native size if max-width kicks in
-  return [
-    (cx - r.left)  * (NW / r.width),
-    (cy - r.top)   * (NH / r.height),
-  ];
+  return [(cx - r.left) * (NW / r.width), (cy - r.top) * (NH / r.height)];
 }}
 
 let drawing = false, sx = 0, sy = 0, rect = {{}}, confirmed = false;
 
 function drawBox(x, y, w, h) {{
   ctx.save();
-  ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2; ctx.setLineDash([6, 3]);
+  ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2; ctx.setLineDash([6,3]);
   ctx.strokeRect(x, y, w, h);
-  ctx.fillStyle = 'rgba(245,158,11,0.10)';
-  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = 'rgba(245,158,11,0.10)'; ctx.fillRect(x, y, w, h);
   ctx.restore();
 }}
-
 function redraw(cx, cy) {{
-  ctx.clearRect(0, 0, NW, NH);
-  ctx.drawImage(img, 0, 0, NW, NH);
+  ctx.clearRect(0, 0, NW, NH); ctx.drawImage(img, 0, 0, NW, NH);
   if (!drawing && confirmed) {{ drawBox(rect.dx, rect.dy, rect.dw, rect.dh); return; }}
   drawBox(sx, sy, cx - sx, cy - sy);
 }}
-
 function updateLabel(x, y, w, h) {{
   document.getElementById('roi-label').innerText =
     'ROI → x:' + x + '  y:' + y + '  w:' + w + '  h:' + h + ' px';
 }}
 
-// ── Mouse events ──────────────────────────────────────────────────────────────
 canvas.addEventListener('mousedown', e => {{
   [sx, sy] = clientToCanvas(e.clientX, e.clientY);
-  drawing = true; confirmed = false;
-  e.preventDefault();
+  drawing = true; confirmed = false; e.preventDefault();
 }});
 canvas.addEventListener('mousemove', e => {{
   if (!drawing) return;
   const [cx, cy] = clientToCanvas(e.clientX, e.clientY);
   redraw(cx, cy);
   updateLabel(
-    Math.round(Math.min(sx, cx) * VW / NW),
-    Math.round(Math.min(sy, cy) * VH / NH),
-    Math.round(Math.abs(cx - sx) * VW / NW),
-    Math.round(Math.abs(cy - sy) * VH / NH),
-  );
-  e.preventDefault();
+    Math.round(Math.min(sx,cx)*VW/NW), Math.round(Math.min(sy,cy)*VH/NH),
+    Math.round(Math.abs(cx-sx)*VW/NW), Math.round(Math.abs(cy-sy)*VH/NH)
+  ); e.preventDefault();
 }});
 canvas.addEventListener('mouseup', e => {{
-  if (!drawing) return;
-  drawing = false;
+  if (!drawing) return; drawing = false;
   const [ex, ey] = clientToCanvas(e.clientX, e.clientY);
   rect = {{
-    dx: Math.min(sx, ex), dy: Math.min(sy, ey),
-    dw: Math.abs(ex - sx), dh: Math.abs(ey - sy),
-    x:  Math.round(Math.min(sx, ex) * VW / NW),
-    y:  Math.round(Math.min(sy, ey) * VH / NH),
-    w:  Math.round(Math.abs(ex - sx) * VW / NW),
-    h:  Math.round(Math.abs(ey - sy) * VH / NH),
+    dx: Math.min(sx,ex), dy: Math.min(sy,ey),
+    dw: Math.abs(ex-sx),  dh: Math.abs(ey-sy),
+    x: Math.round(Math.min(sx,ex)*VW/NW), y: Math.round(Math.min(sy,ey)*VH/NH),
+    w: Math.round(Math.abs(ex-sx)*VW/NW), h: Math.round(Math.abs(ey-sy)*VH/NH),
   }};
-  confirmed = true;
-  redraw(ex, ey);
-  updateLabel(rect.x, rect.y, rect.w, rect.h);
+  confirmed = true; redraw(ex, ey); updateLabel(rect.x, rect.y, rect.w, rect.h);
   e.preventDefault();
 }});
-
-// ── Touch events (mobile / tablet) ───────────────────────────────────────────
 canvas.addEventListener('touchstart', e => {{
-  const t = e.touches[0];
-  [sx, sy] = clientToCanvas(t.clientX, t.clientY);
-  drawing = true; confirmed = false;
-  e.preventDefault();
-}}, {{passive: false}});
+  const t = e.touches[0]; [sx, sy] = clientToCanvas(t.clientX, t.clientY);
+  drawing = true; confirmed = false; e.preventDefault();
+}}, {{passive:false}});
 canvas.addEventListener('touchmove', e => {{
   if (!drawing) return;
-  const t = e.touches[0];
-  const [cx, cy] = clientToCanvas(t.clientX, t.clientY);
-  redraw(cx, cy);
-  e.preventDefault();
-}}, {{passive: false}});
+  const t = e.touches[0]; const [cx,cy] = clientToCanvas(t.clientX, t.clientY);
+  redraw(cx, cy); e.preventDefault();
+}}, {{passive:false}});
 canvas.addEventListener('touchend', e => {{
-  if (!drawing) return;
-  drawing = false;
-  const t = e.changedTouches[0];
-  const [ex, ey] = clientToCanvas(t.clientX, t.clientY);
+  if (!drawing) return; drawing = false;
+  const t = e.changedTouches[0]; const [ex,ey] = clientToCanvas(t.clientX, t.clientY);
   rect = {{
-    dx: Math.min(sx, ex), dy: Math.min(sy, ey),
-    dw: Math.abs(ex - sx), dh: Math.abs(ey - sy),
-    x:  Math.round(Math.min(sx, ex) * VW / NW),
-    y:  Math.round(Math.min(sy, ey) * VH / NH),
-    w:  Math.round(Math.abs(ex - sx) * VW / NW),
-    h:  Math.round(Math.abs(ey - sy) * VH / NH),
+    dx: Math.min(sx,ex), dy: Math.min(sy,ey),
+    dw: Math.abs(ex-sx),  dh: Math.abs(ey-sy),
+    x: Math.round(Math.min(sx,ex)*VW/NW), y: Math.round(Math.min(sy,ey)*VH/NH),
+    w: Math.round(Math.abs(ex-sx)*VW/NW), h: Math.round(Math.abs(ey-sy)*VH/NH),
   }};
-  confirmed = true;
-  redraw(ex, ey);
-  updateLabel(rect.x, rect.y, rect.w, rect.h);
+  confirmed = true; redraw(ex, ey); updateLabel(rect.x, rect.y, rect.w, rect.h);
   e.preventDefault();
-}}, {{passive: false}});
+}}, {{passive:false}});
 
-// ── Confirm ───────────────────────────────────────────────────────────────────
+// ── CONFIRM: post ROI to parent Streamlit via URL hash trick ─────────────────
 function confirmROI() {{
-  if (!confirmed || rect.w < 4 || rect.h < 4) {{
-    alert('Draw a larger ROI first.');
-    return;
-  }}
+  if (!confirmed || rect.w < 4 || rect.h < 4) {{ alert('Draw a larger ROI first.'); return; }}
   const val = rect.x + ',' + rect.y + ',' + rect.w + ',' + rect.h;
+  // Method 1: postMessage to parent
+  window.parent.postMessage({{ type: 'roi_confirmed', value: val }}, '*');
+  // Method 2: also try the hidden input approach as fallback
   const inputs = window.parent.document.querySelectorAll('input[type="text"]');
   for (const inp of inputs) {{
-    if (inp.getAttribute('aria-label') === '__roi_hidden__') {{
-      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+    if (inp.getAttribute('aria-label') === '__roi_bridge__') {{
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
         .set.call(inp, val);
-      inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+      inp.dispatchEvent(new Event('input', {{bubbles:true}}));
       break;
     }}
   }}
@@ -367,7 +327,26 @@ function confirmROI() {{
   btn.classList.add('sent');
   btn.innerText = '✅ ROI Confirmed — scroll down and click Run Vibration Analysis';
 }}
+{preload_js}
 </script>
+"""
+
+
+# ── Helper: render video from bytes using base64 HTML5 player ─────────────────
+def video_player_html(video_bytes: bytes, label: str = "") -> str:
+    """
+    Embed video as base64 data URI inside an HTML5 <video> tag.
+    This bypasses Streamlit's st.video() codec/container issues entirely.
+    """
+    b64 = base64.b64encode(video_bytes).decode()
+    return f"""
+<div style="margin-bottom:8px">
+  {f'<div style="font-size:0.85rem;color:#9ca3af;margin-bottom:4px;">{label}</div>' if label else ''}
+  <video controls style="width:100%;border-radius:10px;border:1px solid #1e1e30;background:#000;">
+    <source src="data:video/mp4;base64,{b64}" type="video/mp4">
+    Your browser does not support the video tag.
+  </video>
+</div>
 """
 
 
@@ -377,25 +356,33 @@ function confirmROI() {{
 st.markdown('<div class="step-badge">STEP 1 — Upload &amp; Magnify</div>', unsafe_allow_html=True)
 st.markdown("### 📤 Upload Video")
 
-uploaded_file = st.file_uploader(
-    "Drop your video here",
-    type=["mp4", "avi", "mov", "mkv"],
-)
+uploaded_file = st.file_uploader("Drop your video here", type=["mp4", "avi", "mov", "mkv"])
 
 tmp_input_path = None
 vid_w = vid_h = total_frames = 0
 vid_fps = 0.0
 
 if uploaded_file:
+    # Cache original bytes in session state so they survive reruns
+    file_bytes = uploaded_file.read()
+    if st.session_state["original_bytes"] is None or uploaded_file.name != st.session_state.get("uploaded_name"):
+        st.session_state["original_bytes"] = file_bytes
+        st.session_state["uploaded_name"]  = uploaded_file.name
+        # New upload → reset downstream state
+        st.session_state["magnified_path"] = None
+        st.session_state["mag_bytes"]      = None
+        st.session_state["confirmed_roi"]  = None
+        st.session_state["roi_input_val"]  = ""
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(uploaded_file.read())
+        tmp.write(file_bytes)
         tmp_input_path = tmp.name
 
     cap = cv2.VideoCapture(tmp_input_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    vid_fps       = cap.get(cv2.CAP_PROP_FPS)
-    vid_w         = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    vid_h         = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    vid_fps      = cap.get(cv2.CAP_PROP_FPS)
+    vid_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
     duration = total_frames / vid_fps if vid_fps > 0 else 0
 
@@ -403,7 +390,15 @@ if uploaded_file:
 
     with left_up:
         st.markdown("**Original**")
-        st.video(uploaded_file)
+        # Render original via HTML5 player — always playable from cached bytes
+        orig_bytes = st.session_state["original_bytes"]
+        if orig_bytes:
+            orig_b64 = base64.b64encode(orig_bytes).decode()
+            st.markdown(f"""
+<video controls style="width:100%;border-radius:10px;border:1px solid #1e1e30;background:#000;">
+  <source src="data:video/mp4;base64,{orig_b64}" type="video/mp4">
+</video>
+""", unsafe_allow_html=True)
         m1, m2, m3 = st.columns(3)
         m1.metric("Resolution", f"{vid_w}×{vid_h}")
         m2.metric("FPS", f"{vid_fps:.0f}")
@@ -414,10 +409,10 @@ if uploaded_file:
         run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
 
         if run_btn:
-            # Reset downstream state when re-running
             st.session_state["magnified_path"] = None
-            st.session_state["mag_bytes"]       = None
-            st.session_state["roi_coords"]      = ""
+            st.session_state["mag_bytes"]      = None
+            st.session_state["confirmed_roi"]  = None
+            st.session_state["roi_input_val"]  = ""
 
             output_path  = tmp_input_path.replace(".mp4", "_magnified.mp4")
             status_box   = st.empty()
@@ -452,10 +447,8 @@ if uploaded_file:
                 eta_box.empty()
                 status_box.success(f"✅ Done in {time.time()-t0:.1f}s — scroll down to analyse")
 
-                # FIX 1: read bytes once and cache them in session_state
                 with open(out_path, "rb") as vf:
                     st.session_state["mag_bytes"] = vf.read()
-
                 st.session_state["magnified_path"] = out_path
                 st.session_state["mag_vid_w"]   = vid_w
                 st.session_state["mag_vid_h"]   = vid_h
@@ -465,20 +458,30 @@ if uploaded_file:
                 status_box.error(f"❌ Error: {e}")
                 progress_bar.empty(); eta_box.empty()
 
-        # FIX 1: render video from cached bytes — survives reruns because it
-        # lives in session_state, not in the transient `if run_btn:` block.
-        cached_bytes = st.session_state.get("mag_bytes")
-        if cached_bytes:
-            st.video(cached_bytes)
+        # Always render magnified video from cached bytes (survives all reruns)
+        mag_bytes = st.session_state.get("mag_bytes")
+        if mag_bytes:
+            mag_b64 = base64.b64encode(mag_bytes).decode()
+            st.markdown(f"""
+<video controls style="width:100%;border-radius:10px;border:1px solid #1e1e30;background:#000;">
+  <source src="data:video/mp4;base64,{mag_b64}" type="video/mp4">
+</video>
+""", unsafe_allow_html=True)
             st.download_button(
                 "⬇️ Download Magnified Video",
-                data=cached_bytes,
+                data=mag_bytes,
                 file_name="magnified_output.mp4",
                 mime="video/mp4",
                 use_container_width=True,
             )
 
 else:
+    # Clear state if file removed
+    st.session_state["original_bytes"]  = None
+    st.session_state["magnified_path"]  = None
+    st.session_state["mag_bytes"]       = None
+    st.session_state["confirmed_roi"]   = None
+    st.session_state["roi_input_val"]   = ""
     st.markdown("""
 <div class="info-card">
 <p style="color:#6b7280; font-size:0.9rem; margin:0;">
@@ -491,7 +494,6 @@ Upload a video above, tune parameters in the sidebar, then click
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 2 — ROI  |  STEP 3 — Vibration Analysis
-#  Only rendered after magnification is complete
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 
@@ -499,26 +501,13 @@ mag_path  = st.session_state.get("magnified_path")
 mag_ready = bool(mag_path and os.path.exists(mag_path))
 
 if not mag_ready:
-    st.markdown(
-        '<div class="step-badge locked">STEP 2 — Draw ROI &nbsp;·&nbsp; run magnification first</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div class="step-badge locked" style="margin-top:6px">'
-        'STEP 3 — Vibration Analysis &nbsp;·&nbsp; run magnification first</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="step-badge locked">STEP 2 — Draw ROI &nbsp;·&nbsp; run magnification first</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-badge locked" style="margin-top:6px">STEP 3 — Vibration Analysis &nbsp;·&nbsp; run magnification first</div>', unsafe_allow_html=True)
 
 else:
-    # ── STEP 2 — Draw ROI on magnified frame ──────────────────────────────────
-    st.markdown(
-        '<div class="step-badge done">STEP 2 — Draw ROI on Magnified Video</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        "Draw a bounding box on the magnified frame below. "
-        "Vibration analysis will run inside this region."
-    )
+    # ── STEP 2 ────────────────────────────────────────────────────────────────
+    st.markdown('<div class="step-badge done">STEP 2 — Draw ROI on Magnified Video</div>', unsafe_allow_html=True)
+    st.markdown("Draw a bounding box on the magnified frame. Vibration analysis will run inside this region.")
 
     m_w   = st.session_state["mag_vid_w"]
     m_h   = st.session_state["mag_vid_h"]
@@ -531,39 +520,42 @@ else:
     if not ret_m:
         st.warning("Could not read first frame of magnified video.")
     else:
-        # FIX 2: cap canvas at 640 px wide so it fits comfortably inside the
-        # Streamlit column without needing horizontal scrolling.
-        # The canvas HTML element uses its exact pixel dimensions; CSS max-width
-        # handles the rare case where the column is even narrower (mobile).
         CANVAS_W = min(640, m_w) if m_w > 0 else 640
         CANVAS_H = int(m_h * CANVAS_W / m_w) if m_w > 0 else 360
 
         _, buf = cv2.imencode(".jpg", first_mag_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
         b64_frame = base64.b64encode(buf.tobytes()).decode()
 
-        # Invisible bridge input — JS writes coords here
-        st.text_input("__roi_hidden__", key="roi_coords", label_visibility="hidden")
+        # ── ROI bridge: hidden text input that JS writes into ─────────────────
+        # We use on_change to immediately move the value into confirmed_roi
+        def _on_roi_change():
+            raw = st.session_state.get("roi_input_val", "").strip()
+            if raw:
+                try:
+                    parts = [int(v) for v in raw.split(",")]
+                    if len(parts) == 4 and parts[2] >= 4 and parts[3] >= 4:
+                        st.session_state["confirmed_roi"] = tuple(parts)
+                except ValueError:
+                    pass
 
-        # FIX 2: give the iframe enough vertical space for canvas + controls.
-        # Extra 160 px accounts for hint text, label, button, and padding.
+        roi_input = st.text_input(
+            label="__roi_bridge__",
+            key="roi_input_val",
+            label_visibility="collapsed",
+            on_change=_on_roi_change,
+        )
+        # Also parse on every render (catches value already in state)
+        _on_roi_change()
+
         components.html(
-            roi_canvas_html(b64_frame, CANVAS_W, CANVAS_H, m_w, m_h),
+            roi_canvas_html(b64_frame, CANVAS_W, CANVAS_H, m_w, m_h,
+                            existing_roi=st.session_state.get("confirmed_roi")),
             height=CANVAS_H + 160,
             scrolling=False,
         )
 
-        # Parse ROI
-        roi_tuple = None
-        raw = st.session_state.get("roi_coords", "").strip()
-        if raw:
-            try:
-                parts = [int(v) for v in raw.split(",")]
-                if len(parts) == 4 and parts[2] >= 4 and parts[3] >= 4:
-                    roi_tuple = tuple(parts)
-            except ValueError:
-                pass
+        roi_tuple = st.session_state.get("confirmed_roi")
 
-        # Static preview once ROI confirmed
         if roi_tuple:
             preview = first_mag_frame.copy()
             cv2.rectangle(
@@ -574,21 +566,18 @@ else:
             )
             st.image(
                 cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
-                caption=(f"Confirmed ROI — x:{roi_tuple[0]}  y:{roi_tuple[1]}  "
-                         f"w:{roi_tuple[2]}  h:{roi_tuple[3]}"),
+                caption=f"Confirmed ROI — x:{roi_tuple[0]}  y:{roi_tuple[1]}  w:{roi_tuple[2]}  h:{roi_tuple[3]}",
                 use_container_width=True,
             )
 
-        # ── STEP 3 — Vibration Analysis ───────────────────────────────────────
+        # ── STEP 3 ────────────────────────────────────────────────────────────
         st.markdown("---")
-        st.markdown(
-            '<div class="step-badge done">STEP 3 — Vibration Analysis</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<div class="step-badge done">STEP 3 — Vibration Analysis</div>', unsafe_allow_html=True)
 
         run_analysis = st.button("📊 Run Vibration Analysis", use_container_width=True)
 
         if run_analysis:
+            roi_tuple = st.session_state.get("confirmed_roi")
             if roi_tuple is None:
                 st.warning("⚠️ Draw and confirm an ROI in Step 2 first.")
             else:
@@ -613,11 +602,7 @@ else:
                     st.markdown("#### 📈 Vibration Results")
                     r1, r2, r3, r4 = st.columns(4)
                     r1.metric("Dominant Freq", f"{result['dominant_hz']:.3f} Hz")
-                    r2.metric(
-                        "Period",
-                        f"{1/result['dominant_hz']:.3f} s"
-                        if result["dominant_hz"] > 0 else "—",
-                    )
+                    r2.metric("Period", f"{1/result['dominant_hz']:.3f} s" if result["dominant_hz"] > 0 else "—")
                     r3.metric("Amplitude", f"{result['dominant_amp']:.4f} px")
                     r4.metric("Frames analysed", str(len(result["motion"])))
 
@@ -625,7 +610,6 @@ else:
                     st.pyplot(fig, use_container_width=True)
                     plt.close(fig)
 
-                    # CSV exports
                     csv_motion = io.StringIO()
                     csv_motion.write("time_s,motion_px_per_frame\n")
                     for t, m in zip(result["times"], result["motion"]):
@@ -638,26 +622,16 @@ else:
 
                     dl1, dl2 = st.columns(2)
                     with dl1:
-                        st.download_button(
-                            "⬇️ Motion Signal (CSV)",
-                            data=csv_motion.getvalue(),
-                            file_name="motion_signal.csv",
-                            mime="text/csv",
-                            use_container_width=True,
-                        )
+                        st.download_button("⬇️ Motion Signal (CSV)", data=csv_motion.getvalue(),
+                                           file_name="motion_signal.csv", mime="text/csv", use_container_width=True)
                     with dl2:
-                        st.download_button(
-                            "⬇️ FFT Spectrum (CSV)",
-                            data=csv_fft.getvalue(),
-                            file_name="fft_spectrum.csv",
-                            mime="text/csv",
-                            use_container_width=True,
-                        )
+                        st.download_button("⬇️ FFT Spectrum (CSV)", data=csv_fft.getvalue(),
+                                           file_name="fft_spectrum.csv", mime="text/csv", use_container_width=True)
 
                 except Exception as e:
                     an_status.error(f"❌ Analysis error: {e}")
 
-        elif not roi_tuple:
+        elif not st.session_state.get("confirmed_roi"):
             st.info("Confirm an ROI in Step 2 above, then click **Run Vibration Analysis**.")
 
 
