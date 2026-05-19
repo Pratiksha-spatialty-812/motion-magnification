@@ -6,6 +6,7 @@ import os
 import io
 import time
 import base64
+import subprocess
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -41,16 +42,19 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 }
 .step-badge.done   { background: linear-gradient(135deg, #059669, #0284c7); }
 .step-badge.locked { background: #1e1e30; color: #4b5563; }
-.param-label { font-family: 'Space Mono', monospace; font-size: 0.73rem; color: #a78bfa; text-transform: uppercase; margin-bottom: 2px; }
+.param-label {
+    font-family: 'Space Mono', monospace; font-size: 0.73rem;
+    color: #a78bfa; text-transform: uppercase; margin-bottom: 2px;
+}
 .stButton > button {
     background: linear-gradient(135deg, #7c3aed, #2563eb) !important; color: white !important;
-    border: none !important; border-radius: 8px !important; font-family: 'Syne', sans-serif !important;
-    font-weight: 600 !important; width: 100%;
+    border: none !important; border-radius: 8px !important;
+    font-family: 'Syne', sans-serif !important; font-weight: 600 !important; width: 100%;
 }
 .stDownloadButton > button {
     background: linear-gradient(135deg, #059669, #0284c7) !important; color: white !important;
-    border: none !important; border-radius: 8px !important; font-family: 'Syne', sans-serif !important;
-    font-weight: 600 !important; width: 100%;
+    border: none !important; border-radius: 8px !important;
+    font-family: 'Syne', sans-serif !important; font-weight: 600 !important; width: 100%;
 }
 .stProgress > div > div { background: linear-gradient(90deg, #7c3aed, #38bdf8) !important; }
 [data-testid="stMetric"] { background: #13131f; border: 1px solid #1e1e30; border-radius: 10px; padding: 1rem; }
@@ -65,46 +69,59 @@ st.markdown("---")
 
 # ── Session state ──────────────────────────────────────────────────────────────
 for k, v in [
-    ("magnified_path", None),
-    ("mag_vid_w",      0),
-    ("mag_vid_h",      0),
-    ("mag_vid_fps",    0.0),
-    ("confirmed_roi",  None),   # (x,y,w,h) — only written by Confirm button
-    ("orig_tmp_path",  None),   # saved tmp path for original
+    ("orig_tmp_path",    None),
+    ("orig_vid_bytes",   None),   # browser-safe h264 bytes of original
+    ("magnified_path",   None),
+    ("mag_vid_bytes",    None),   # browser-safe h264 bytes of magnified
+    ("mag_vid_w",        0),
+    ("mag_vid_h",        0),
+    ("mag_vid_fps",      0.0),
+    ("confirmed_roi",    None),
+    ("last_upload_name", None),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── Sidebar ────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## ⚙️ Magnification Parameters")
-    st.markdown("---")
-    st.markdown('<div class="param-label">Alpha</div>', unsafe_allow_html=True)
-    alpha = st.slider("Alpha", 10, 200, 100, 5)
-    st.markdown('<div class="param-label">Lambda C (px)</div>', unsafe_allow_html=True)
-    lambda_c = st.slider("Lambda C", 1, 100, 20, 1)
-    st.markdown('<div class="param-label">fl — Low Cutoff (Hz)</div>', unsafe_allow_html=True)
-    fl = st.slider("fl (Hz)", 0.1, 10.0, 1.0, 0.1)
-    st.markdown('<div class="param-label">fh — High Cutoff (Hz)</div>', unsafe_allow_html=True)
-    fh = st.slider("fh (Hz)", 1.0, 30.0, 14.0, 0.5)
-    st.markdown('<div class="param-label">FPS</div>', unsafe_allow_html=True)
-    fps_sidebar = st.slider("FPS", 15, 60, 30, 1)
-    st.markdown("---")
-    st.markdown("### 🔺 Pyramid Settings")
-    n_levels_raw = st.slider("Pyramid Levels (0=auto)", 0, 8, 0, 1)
-    n_levels = None if n_levels_raw == 0 else n_levels_raw
-    alpha_curve = st.selectbox("Alpha Curve", list(ALPHA_CURVES.keys()), index=0)
-    st.markdown("---")
-    st.markdown("### 🌊 Vibration Analysis")
-    of_method = st.selectbox("Optical Flow Method", ["farneback", "lucas_kanade"])
 
-# ── Vibration plot ─────────────────────────────────────────────────────────────
-def make_plot(result):
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 5), facecolor="#0d0d18", constrained_layout=True)
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def to_browser_mp4_bytes(input_path: str) -> bytes:
+    """
+    Re-encode any video to H.264/yuv420p MP4 that every browser can play.
+    Returns bytes ready for st.video().
+    """
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        out_path = tmp.name
+    try:
+        r = subprocess.run([
+            "ffmpeg", "-y", "-i", input_path,
+            "-vcodec", "libx264", "-crf", "23", "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            # ensure even dimensions (required by yuv420p)
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-movflags", "+faststart",
+            "-an",
+            out_path,
+        ], capture_output=True, timeout=600)
+        if r.returncode != 0 or not os.path.exists(out_path):
+            return b""
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+
+
+def make_plot(result: dict) -> plt.Figure:
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 5),
+                                   facecolor="#0d0d18", constrained_layout=True)
     for ax in (ax1, ax2):
         ax.set_facecolor("#0d0d18")
         ax.tick_params(colors="#9ca3af", labelsize=8)
-        for sp in ax.spines.values(): sp.set_edgecolor("#1e1e30")
+        for sp in ax.spines.values():
+            sp.set_edgecolor("#1e1e30")
     ax1.plot(result["times"], result["motion"], color="#38bdf8", lw=1.2)
     ax1.set_xlabel("Time (s)", color="#9ca3af", fontsize=8)
     ax1.set_ylabel("Mean Flow (px/frame)", color="#9ca3af", fontsize=8)
@@ -123,8 +140,120 @@ def make_plot(result):
     return fig
 
 
+def roi_canvas_html(b64_img: str, canvas_w: int, canvas_h: int,
+                    vid_w: int, vid_h: int) -> str:
+    """
+    Canvas ROI picker that posts the selection via a Streamlit query-param trick:
+    clicking Confirm appends ?roi=x,y,w,h to the page URL which Streamlit reads
+    via st.query_params — no cross-frame DOM manipulation needed.
+    """
+    return f"""
+<style>
+  body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; }}
+  canvas {{ display:block; cursor:crosshair; border-radius:8px; border:2px solid #2d2d4e; max-width:100%; }}
+  #hint {{ font-size:0.7rem; color:#6b7280; margin:5px 0 6px; }}
+  #lbl  {{ font-size:0.75rem; color:#38bdf8; background:#13131f; border:1px solid #1e1e30;
+           border-radius:5px; padding:4px 10px; display:inline-block; margin-bottom:6px; }}
+  #btn  {{
+    background:linear-gradient(135deg,#7c3aed,#2563eb); color:#fff; border:none;
+    border-radius:7px; font-family:'Syne',sans-serif; font-weight:700;
+    font-size:0.85rem; padding:6px 22px; cursor:pointer;
+  }}
+  #btn.ok {{ background:linear-gradient(135deg,#059669,#0284c7); }}
+</style>
+<canvas id="c" width="{canvas_w}" height="{canvas_h}"></canvas>
+<div id="hint">Drag to draw ROI, then click Confirm.</div>
+<div id="lbl">No ROI drawn yet</div><br>
+<button id="btn" onclick="confirm_roi()">✅ Confirm ROI</button>
+<script>
+const C = document.getElementById('c');
+const ctx = C.getContext('2d');
+const NW={canvas_w}, NH={canvas_h}, VW={vid_w}, VH={vid_h};
+const img = new Image();
+img.onload = ()=> ctx.drawImage(img,0,0,NW,NH);
+img.src = 'data:image/jpeg;base64,{b64_img}';
+
+function pt(e){{
+  const r=C.getBoundingClientRect();
+  const src = e.touches ? e.touches[0] : e;
+  return [(src.clientX-r.left)*(NW/r.width), (src.clientY-r.top)*(NH/r.height)];
+}}
+let drawing=false, sx=0,sy=0, box={{}}, done=false;
+function draw_box(x,y,w,h){{
+  ctx.save(); ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]);
+  ctx.strokeRect(x,y,w,h);
+  ctx.fillStyle='rgba(245,158,11,0.12)'; ctx.fillRect(x,y,w,h);
+  ctx.restore();
+}}
+function redraw(ex,ey){{
+  ctx.clearRect(0,0,NW,NH); ctx.drawImage(img,0,0,NW,NH);
+  draw_box(Math.min(sx,ex),Math.min(sy,ey),Math.abs(ex-sx),Math.abs(ey-sy));
+}}
+function set_label(x,y,w,h){{
+  document.getElementById('lbl').innerText='ROI → x:'+x+' y:'+y+' w:'+w+' h:'+h;
+}}
+function to_vid(cx,cy,ex,ey){{
+  return {{
+    x:Math.round(Math.min(cx,ex)*VW/NW), y:Math.round(Math.min(cy,ey)*VH/NH),
+    w:Math.round(Math.abs(ex-cx)*VW/NW), h:Math.round(Math.abs(ey-cy)*VH/NH),
+    dx:Math.min(cx,ex), dy:Math.min(cy,ey),
+    dw:Math.abs(ex-cx), dh:Math.abs(ey-cy),
+  }};
+}}
+C.addEventListener('mousedown', e=>{{ [sx,sy]=pt(e); drawing=true; done=false; e.preventDefault(); }});
+C.addEventListener('mousemove', e=>{{ if(!drawing)return; const[ex,ey]=pt(e); redraw(ex,ey);
+  const b=to_vid(sx,sy,ex,ey); set_label(b.x,b.y,b.w,b.h); e.preventDefault(); }});
+C.addEventListener('mouseup',   e=>{{ if(!drawing)return; drawing=false;
+  const[ex,ey]=pt(e); redraw(ex,ey); box=to_vid(sx,sy,ex,ey);
+  set_label(box.x,box.y,box.w,box.h); done=true; e.preventDefault(); }});
+C.addEventListener('touchstart', e=>{{ [sx,sy]=pt(e); drawing=true; done=false; e.preventDefault(); }}, {{passive:false}});
+C.addEventListener('touchmove',  e=>{{ if(!drawing)return; const[ex,ey]=pt(e); redraw(ex,ey); e.preventDefault(); }}, {{passive:false}});
+C.addEventListener('touchend',   e=>{{ if(!drawing)return; drawing=false;
+  const[ex,ey]=pt(e); box=to_vid(sx,sy,ex,ey); set_label(box.x,box.y,box.w,box.h); done=true; e.preventDefault(); }}, {{passive:false}});
+
+function confirm_roi(){{
+  if(!done||box.w<4||box.h<4){{ alert('Draw a larger box first.'); return; }}
+  const val = box.x+','+box.y+','+box.w+','+box.h;
+  // Write into every text input in parent that has our sentinel aria-label
+  try {{
+    const inputs = window.parent.document.querySelectorAll('input[aria-label="roi_value_input"]');
+    inputs.forEach(inp => {{
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
+        .set.call(inp, val);
+      inp.dispatchEvent(new Event('input', {{bubbles:true}}));
+    }});
+  }} catch(err) {{ console.warn('parent DOM access failed', err); }}
+  document.getElementById('btn').className='ok';
+  document.getElementById('btn').innerText='✅ ROI set — now click Confirm ROI button below';
+}}
+</script>
+"""
+
+
+# ── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Parameters")
+    st.markdown("---")
+    st.markdown('<div class="param-label">Alpha</div>', unsafe_allow_html=True)
+    alpha = st.slider("Alpha", 10, 200, 100, 5)
+    st.markdown('<div class="param-label">Lambda C (px)</div>', unsafe_allow_html=True)
+    lambda_c = st.slider("Lambda C", 1, 100, 20, 1)
+    st.markdown('<div class="param-label">fl — Low Cutoff (Hz)</div>', unsafe_allow_html=True)
+    fl = st.slider("fl (Hz)", 0.1, 10.0, 1.0, 0.1)
+    st.markdown('<div class="param-label">fh — High Cutoff (Hz)</div>', unsafe_allow_html=True)
+    fh = st.slider("fh (Hz)", 1.0, 30.0, 14.0, 0.5)
+    st.markdown('<div class="param-label">FPS</div>', unsafe_allow_html=True)
+    fps_sidebar = st.slider("FPS", 15, 60, 30, 1)
+    st.markdown("---")
+    n_levels_raw = st.slider("Pyramid Levels (0=auto)", 0, 8, 0, 1)
+    n_levels = None if n_levels_raw == 0 else n_levels_raw
+    alpha_curve = st.selectbox("Alpha Curve", list(ALPHA_CURVES.keys()), index=0)
+    st.markdown("---")
+    of_method = st.selectbox("Optical Flow Method", ["farneback", "lucas_kanade"])
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 1 — Upload & Magnify
+#  STEP 1
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown('<div class="step-badge">STEP 1 — Upload &amp; Magnify</div>', unsafe_allow_html=True)
 st.markdown("### 📤 Upload Video")
@@ -136,13 +265,28 @@ vid_w = vid_h = total_frames = 0
 vid_fps = 0.0
 
 if uploaded_file:
-    # Write to a stable tmp file once per upload
-    if st.session_state["orig_tmp_path"] is None or \
-       not os.path.exists(st.session_state["orig_tmp_path"]):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-            tmp.write(uploaded_file.read())
+    fname = uploaded_file.name
+
+    # ── Save raw upload to a stable tmp file ──────────────────────────────────
+    if st.session_state["last_upload_name"] != fname:
+        # New file uploaded — reset everything
+        raw_bytes = uploaded_file.read()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(fname)[1]) as tmp:
+            tmp.write(raw_bytes)
             st.session_state["orig_tmp_path"] = tmp.name
+        st.session_state["last_upload_name"] = fname
+        st.session_state["orig_vid_bytes"]   = None   # will re-encode below
+        st.session_state["magnified_path"]   = None
+        st.session_state["mag_vid_bytes"]    = None
+        st.session_state["confirmed_roi"]    = None
+
     tmp_input_path = st.session_state["orig_tmp_path"]
+
+    # ── Encode original to browser-safe bytes (once) ──────────────────────────
+    if st.session_state["orig_vid_bytes"] is None:
+        with st.spinner("Preparing original video for playback…"):
+            b = to_browser_mp4_bytes(tmp_input_path)
+            st.session_state["orig_vid_bytes"] = b
 
     cap = cv2.VideoCapture(tmp_input_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -156,9 +300,9 @@ if uploaded_file:
 
     with left_up:
         st.markdown("**Original**")
-        # st.video reads from the UploadedFile object — seek to start first
-        uploaded_file.seek(0)
-        st.video(uploaded_file)
+        orig_bytes = st.session_state["orig_vid_bytes"]
+        if orig_bytes:
+            st.video(orig_bytes, format="video/mp4")
         m1, m2, m3 = st.columns(3)
         m1.metric("Resolution", f"{vid_w}×{vid_h}")
         m2.metric("FPS", f"{vid_fps:.0f}")
@@ -170,42 +314,56 @@ if uploaded_file:
 
         if run_btn:
             st.session_state["magnified_path"] = None
+            st.session_state["mag_vid_bytes"]  = None
             st.session_state["confirmed_roi"]  = None
 
-            output_path  = tmp_input_path.replace(".mp4", "_magnified.mp4")
-            status_box   = st.empty()
-            progress_bar = st.progress(0)
-            eta_box      = st.empty()
+            raw_out = tmp_input_path.replace(os.path.splitext(tmp_input_path)[1], "_mag_raw.mp4")
+            h264_out = tmp_input_path.replace(os.path.splitext(tmp_input_path)[1], "_mag.mp4")
+
+            status   = st.empty()
+            prog     = st.progress(0)
+            eta_slot = st.empty()
             t0 = time.time()
 
-            def _mag_cb(cur, tot):
-                progress_bar.progress(cur / tot)
-                elapsed = time.time() - t0
+            def _cb(cur, tot):
+                prog.progress(cur / tot)
+                el = time.time() - t0
                 if cur > 1:
-                    eta = (elapsed / (cur/tot)) * (1 - cur/tot)
-                    eta_box.caption(f"Frame {cur}/{tot} · ETA {eta:.0f}s")
+                    eta_slot.caption(f"Frame {cur}/{tot} · ETA {(el/(cur/tot))*(1-cur/tot):.0f}s")
 
             try:
-                status_box.info("🔄 Processing frames…")
+                status.info("🔄 Processing frames…")
+                # process_video already calls _remux_h264 internally,
+                # but we do our own reliable transcode afterwards
                 out_path = process_video(
-                    input_path=tmp_input_path, output_path=output_path,
+                    input_path=tmp_input_path, output_path=raw_out,
                     alpha=alpha, lambda_c=lambda_c, fl=fl, fh=fh, fps=fps_sidebar,
-                    progress_callback=_mag_cb, n_levels=n_levels, alpha_curve=alpha_curve,
+                    progress_callback=_cb, n_levels=n_levels, alpha_curve=alpha_curve,
                 )
-                progress_bar.progress(1.0); eta_box.empty()
-                status_box.success(f"✅ Done in {time.time()-t0:.1f}s")
+                prog.progress(1.0); eta_slot.empty()
+
+                # Always re-encode output to guaranteed browser-safe h264
+                status.info("🎞 Encoding for browser playback…")
+                mag_bytes = to_browser_mp4_bytes(out_path)
+                if not mag_bytes:
+                    # fallback: try reading whatever process_video wrote
+                    with open(out_path, "rb") as f:
+                        mag_bytes = f.read()
+
+                st.session_state["mag_vid_bytes"]  = mag_bytes
                 st.session_state["magnified_path"] = out_path
                 st.session_state["mag_vid_w"]   = vid_w
                 st.session_state["mag_vid_h"]   = vid_h
                 st.session_state["mag_vid_fps"] = vid_fps if vid_fps > 0 else float(fps_sidebar)
-            except Exception as e:
-                status_box.error(f"❌ Error: {e}")
+                status.success(f"✅ Done in {time.time()-t0:.1f}s")
 
-        # Show magnified video — read from file path stored in session_state
-        mag_path_ss = st.session_state.get("magnified_path")
-        if mag_path_ss and os.path.exists(mag_path_ss):
-            with open(mag_path_ss, "rb") as f:
-                mag_bytes = f.read()
+            except Exception as e:
+                status.error(f"❌ {e}")
+                prog.empty(); eta_slot.empty()
+
+        # Render magnified video (persists across reruns via session_state)
+        mag_bytes = st.session_state.get("mag_vid_bytes")
+        if mag_bytes:
             st.video(mag_bytes, format="video/mp4")
             st.download_button(
                 "⬇️ Download Magnified Video", data=mag_bytes,
@@ -214,14 +372,14 @@ if uploaded_file:
             )
 
 else:
-    st.session_state["orig_tmp_path"] = None
-    st.session_state["magnified_path"] = None
-    st.session_state["confirmed_roi"]  = None
+    for k in ["orig_tmp_path","orig_vid_bytes","magnified_path",
+              "mag_vid_bytes","confirmed_roi","last_upload_name"]:
+        st.session_state[k] = None
     st.info("Upload a video above, tune parameters in the sidebar, then click **Run Motion Magnification**.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 2 — ROI picker (pure Streamlit — no JS iframe bridge)
+#  STEP 2 — ROI canvas
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 
@@ -232,12 +390,14 @@ if not mag_ready:
     st.markdown('<div class="step-badge locked">STEP 2 — Draw ROI · run magnification first</div>', unsafe_allow_html=True)
     st.markdown('<div class="step-badge locked" style="margin-top:6px">STEP 3 — Vibration Analysis · run magnification first</div>', unsafe_allow_html=True)
 else:
-    st.markdown('<div class="step-badge done">STEP 2 — Select ROI on Magnified Frame</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step-badge done">STEP 2 — Draw ROI on Magnified Frame</div>', unsafe_allow_html=True)
+    st.markdown("Drag a box on the frame below to select the region for vibration analysis.")
 
     m_w   = st.session_state["mag_vid_w"]
     m_h   = st.session_state["mag_vid_h"]
     m_fps = st.session_state["mag_vid_fps"]
 
+    # Extract first frame
     cap_m = cv2.VideoCapture(mag_path)
     ret_m, first_frame = cap_m.read()
     cap_m.release()
@@ -245,57 +405,63 @@ else:
     if not ret_m:
         st.warning("Could not read first frame of magnified video.")
     else:
-        st.markdown(
-            "Set **X, Y, Width, Height** of the region to analyse. "
-            "The preview below updates live."
+        # ── Canvas sizing: max 560px wide, maintain aspect ratio ──────────────
+        CANVAS_W = min(560, m_w) if m_w > 0 else 560
+        CANVAS_H = int(m_h * CANVAS_W / m_w) if m_w > 0 else 400
+
+        _, buf = cv2.imencode(".jpg", first_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        b64_frame = base64.b64encode(buf.tobytes()).decode()
+
+        # ── Hidden text input: JS writes "x,y,w,h" here ──────────────────────
+        # Use a form so pressing Enter or the Confirm button below both work
+        roi_pending = st.text_input(
+            "roi_value_input",
+            key="roi_raw_input",
+            label_visibility="collapsed",
+            placeholder="ROI coordinates appear here after drawing — then click Confirm ROI",
         )
 
-        # ── Numeric ROI inputs — pure Streamlit, no JS needed ─────────────────
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            st.markdown('<div class="param-label">X (left)</div>', unsafe_allow_html=True)
-            roi_x = st.number_input("X", min_value=0, max_value=max(m_w-1, 0),
-                                    value=int(m_w * 0.25), step=1, label_visibility="collapsed")
-        with c2:
-            st.markdown('<div class="param-label">Y (top)</div>', unsafe_allow_html=True)
-            roi_y = st.number_input("Y", min_value=0, max_value=max(m_h-1, 0),
-                                    value=int(m_h * 0.25), step=1, label_visibility="collapsed")
-        with c3:
-            st.markdown('<div class="param-label">Width</div>', unsafe_allow_html=True)
-            roi_w = st.number_input("W", min_value=4, max_value=max(m_w, 4),
-                                    value=int(m_w * 0.5), step=1, label_visibility="collapsed")
-        with c4:
-            st.markdown('<div class="param-label">Height</div>', unsafe_allow_html=True)
-            roi_h = st.number_input("H", min_value=4, max_value=max(m_h, 4),
-                                    value=int(m_h * 0.5), step=1, label_visibility="collapsed")
+        components.html(
+            roi_canvas_html(b64_frame, CANVAS_W, CANVAS_H, m_w, m_h),
+            height=CANVAS_H + 130,
+            scrolling=False,
+        )
 
-        # Clamp to frame bounds
-        roi_x = int(min(roi_x, m_w - 4))
-        roi_y = int(min(roi_y, m_h - 4))
-        roi_w = int(min(roi_w, m_w - roi_x))
-        roi_h = int(min(roi_h, m_h - roi_y))
+        # Confirm button — reads the text input and locks the ROI
+        col_confirm, col_clear = st.columns([3, 1])
+        with col_confirm:
+            if st.button("✅ Confirm ROI", use_container_width=True):
+                raw = st.session_state.get("roi_raw_input", "").strip()
+                if raw:
+                    try:
+                        parts = [int(v) for v in raw.split(",")]
+                        if len(parts) == 4 and parts[2] >= 4 and parts[3] >= 4:
+                            st.session_state["confirmed_roi"] = tuple(parts)
+                            st.success(f"✅ ROI confirmed: x={parts[0]}, y={parts[1]}, w={parts[2]}, h={parts[3]}")
+                        else:
+                            st.warning("ROI too small — draw a larger box.")
+                    except ValueError:
+                        st.warning("Draw a box on the canvas first, then click Confirm ROI.")
+                else:
+                    st.warning("Draw a box on the canvas first, then click Confirm ROI.")
+        with col_clear:
+            if st.button("🗑 Clear", use_container_width=True):
+                st.session_state["confirmed_roi"] = None
 
-        # Live preview with rectangle
-        preview = first_frame.copy()
-        cv2.rectangle(preview, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (245, 158, 11), 2)
-        # Overlay semi-transparent fill
-        overlay = preview.copy()
-        cv2.rectangle(overlay, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (245, 158, 11), -1)
-        preview = cv2.addWeighted(overlay, 0.15, preview, 0.85, 0)
-        cv2.rectangle(preview, (roi_x, roi_y), (roi_x + roi_w, roi_y + roi_h), (245, 158, 11), 2)
-
-        st.image(cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
-                 caption=f"ROI preview — x:{roi_x}  y:{roi_y}  w:{roi_w}  h:{roi_h}",
-                 use_container_width=True)
-
-        if st.button("✅ Confirm ROI", use_container_width=True):
-            st.session_state["confirmed_roi"] = (roi_x, roi_y, roi_w, roi_h)
-            st.success(f"ROI confirmed: x={roi_x}, y={roi_y}, w={roi_w}, h={roi_h}")
-
-        # Show currently confirmed ROI
+        # Show confirmed ROI preview
         confirmed = st.session_state.get("confirmed_roi")
         if confirmed:
-            st.info(f"✅ Active ROI for analysis: x={confirmed[0]}, y={confirmed[1]}, w={confirmed[2]}, h={confirmed[3]}")
+            rx, ry, rw, rh = confirmed
+            preview = first_frame.copy()
+            overlay = preview.copy()
+            cv2.rectangle(overlay, (rx, ry), (rx+rw, ry+rh), (245, 158, 11), -1)
+            preview = cv2.addWeighted(overlay, 0.18, preview, 0.82, 0)
+            cv2.rectangle(preview, (rx, ry), (rx+rw, ry+rh), (245, 158, 11), 2)
+            st.image(
+                cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+                caption=f"Active ROI — x:{rx}  y:{ry}  w:{rw}  h:{rh}",
+                use_container_width=True,
+            )
 
         # ── STEP 3 ────────────────────────────────────────────────────────────
         st.markdown("---")
@@ -304,56 +470,57 @@ else:
         if st.button("📊 Run Vibration Analysis", use_container_width=True):
             roi_tuple = st.session_state.get("confirmed_roi")
             if roi_tuple is None:
-                st.warning("⚠️ Click **Confirm ROI** in Step 2 first.")
+                st.warning("⚠️ Draw a box and click **Confirm ROI** in Step 2 first.")
             else:
-                an_status   = st.empty()
-                an_progress = st.progress(0)
-                an_status.info("🔄 Computing optical flow…")
+                an_status = st.empty()
+                an_prog   = st.progress(0)
+                an_status.info("🔄 Computing optical flow on magnified video…")
 
                 def _an_cb(cur, tot):
-                    an_progress.progress(min(cur / tot, 1.0))
+                    an_prog.progress(min(cur / tot, 1.0))
 
                 try:
+                    # Analysis runs on the magnified video file
                     result = analyze_vibration(
                         input_path=mag_path, roi=roi_tuple,
                         fps=m_fps, method=of_method,
                         progress_callback=_an_cb,
                     )
-                    an_progress.progress(1.0)
+                    an_prog.progress(1.0)
                     an_status.success("✅ Analysis complete!")
 
                     r1, r2, r3, r4 = st.columns(4)
                     r1.metric("Dominant Freq", f"{result['dominant_hz']:.3f} Hz")
                     r2.metric("Period", f"{1/result['dominant_hz']:.3f} s" if result["dominant_hz"] > 0 else "—")
-                    r3.metric("Amplitude", f"{result['dominant_amp']:.4f} px")
-                    r4.metric("Frames analysed", str(len(result["motion"])))
+                    r3.metric("Amplitude",     f"{result['dominant_amp']:.4f} px")
+                    r4.metric("Frames",         str(len(result["motion"])))
 
                     fig = make_plot(result)
                     st.pyplot(fig, use_container_width=True)
                     plt.close(fig)
 
-                    csv_motion = io.StringIO()
-                    csv_motion.write("time_s,motion_px_per_frame\n")
+                    csv_m = io.StringIO()
+                    csv_m.write("time_s,motion_px_per_frame\n")
                     for t, m in zip(result["times"], result["motion"]):
-                        csv_motion.write(f"{t:.6f},{m:.6f}\n")
-                    csv_fft = io.StringIO()
-                    csv_fft.write("freq_hz,power\n")
+                        csv_m.write(f"{t:.6f},{m:.6f}\n")
+                    csv_f = io.StringIO()
+                    csv_f.write("freq_hz,power\n")
                     for f, p in zip(result["freqs"], result["power"]):
-                        csv_fft.write(f"{f:.6f},{p:.6f}\n")
+                        csv_f.write(f"{f:.6f},{p:.6f}\n")
 
                     dl1, dl2 = st.columns(2)
                     with dl1:
-                        st.download_button("⬇️ Motion Signal (CSV)", csv_motion.getvalue(),
+                        st.download_button("⬇️ Motion Signal (CSV)", csv_m.getvalue(),
                                            "motion_signal.csv", "text/csv", use_container_width=True)
                     with dl2:
-                        st.download_button("⬇️ FFT Spectrum (CSV)", csv_fft.getvalue(),
+                        st.download_button("⬇️ FFT Spectrum (CSV)", csv_f.getvalue(),
                                            "fft_spectrum.csv", "text/csv", use_container_width=True)
 
                 except Exception as e:
-                    an_status.error(f"❌ Analysis error: {e}")
+                    an_status.error(f"❌ {e}")
         else:
             if not st.session_state.get("confirmed_roi"):
-                st.info("Set ROI coordinates above, click **Confirm ROI**, then click **Run Vibration Analysis**.")
+                st.info("Draw and confirm an ROI above, then click **Run Vibration Analysis**.")
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("---")
