@@ -281,9 +281,8 @@ else:
         st.session_state[k] = None
     st.info("Upload a video above, tune parameters in the sidebar, then click **Run Motion Magnification**.")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 2 — ROI via streamlit-drawable-canvas
+#  STEP 2 — ROI canvas
 # ══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 
@@ -301,7 +300,6 @@ else:
     m_h   = st.session_state["mag_vid_h"]
     m_fps = st.session_state["mag_vid_fps"]
 
-    # Extract first frame
     cap_m = cv2.VideoCapture(mag_path)
     ret_m, first_frame = cap_m.read()
     cap_m.release()
@@ -309,75 +307,170 @@ else:
     if not ret_m:
         st.warning("Could not read first frame of magnified video.")
     else:
-        # Canvas sizing — max 700px wide, maintain aspect ratio
         CANVAS_W = min(700, m_w) if m_w > 0 else 700
         CANVAS_H = int(m_h * CANVAS_W / m_w) if m_w > 0 else 400
+
         _, buf = cv2.imencode(".jpg", first_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         b64_frame = base64.b64encode(buf.tobytes()).decode()
-        bg_url = f"data:image/jpeg;base64,{b64_frame}"
 
-        canvas_result = st_canvas(
-            fill_color   = "rgba(245, 158, 11, 0.15)",
-            stroke_width = 2,
-            stroke_color = "#f59e0b",
-            background_url   = bg_url,
-            update_streamlit = True,
-            width        = CANVAS_W,
-            height       = CANVAS_H,
-            drawing_mode = "rect",
-            key          = "roi_canvas",
-        )
-        
-        # ── Read coordinates from canvas result into pending_roi ──────────────
-        pending_roi = None
-        if (
-            canvas_result.json_data is not None
-            and len(canvas_result.json_data.get("objects", [])) > 0
-        ):
-            obj = canvas_result.json_data["objects"][-1]   # last drawn rect
-            scale_x = m_w / CANVAS_W
-            scale_y = m_h / CANVAS_H
-            rx = int(obj["left"]   * scale_x)
-            ry = int(obj["top"]    * scale_y)
-            rw = int(obj["width"]  * scale_x)
-            rh = int(obj["height"] * scale_y)
+        # ── Check if canvas posted ROI via query params ───────────────────────
+        qp = st.query_params
+        if "roi" in qp:
+            try:
+                parts = [int(v) for v in qp["roi"].split(",")]
+                if len(parts) == 4 and parts[2] >= 4 and parts[3] >= 4:
+                    st.session_state["pending_roi"] = tuple(parts)
+            except Exception:
+                pass
 
-            if rw >= 4 and rh >= 4:
-                pending_roi = (rx, ry, rw, rh)
-                # Show live preview of what will be confirmed
-                st.caption(f"📐 Drawn — x:{rx}  y:{ry}  w:{rw}  h:{rh}  ← click Confirm ROI to lock")
+        pending = st.session_state.get("pending_roi")
+        if pending:
+            st.info(f"📐 Drawn — x:{pending[0]}  y:{pending[1]}  w:{pending[2]}  h:{pending[3]}  ← click Confirm ROI to lock")
+
+        # ── Canvas HTML — on Confirm writes ?roi=x,y,w,h to the URL ──────────
+        canvas_html = f"""
+<style>
+  body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; }}
+  canvas {{ display:block; cursor:crosshair; border-radius:8px;
+            border:2px solid #2d2d4e; max-width:100%; }}
+  #hint {{ font-size:0.7rem; color:#6b7280; margin:5px 0 6px; }}
+  #lbl  {{ font-size:0.75rem; color:#38bdf8; background:#13131f;
+           border:1px solid #1e1e30; border-radius:5px;
+           padding:4px 10px; display:inline-block; margin-bottom:6px; }}
+  #btn  {{ background:linear-gradient(135deg,#7c3aed,#2563eb); color:#fff;
+           border:none; border-radius:7px; font-family:'Syne',sans-serif;
+           font-weight:700; font-size:0.85rem; padding:8px 26px;
+           cursor:pointer; margin-top:6px; }}
+  #btn.ok {{ background:linear-gradient(135deg,#059669,#0284c7); }}
+</style>
+<canvas id="c" width="{CANVAS_W}" height="{CANVAS_H}"></canvas>
+<div id="hint">Drag to draw ROI, then click Confirm ROI.</div>
+<div id="lbl">No ROI drawn yet</div><br>
+<button id="btn" onclick="confirm_roi()">✅ Confirm ROI</button>
+<script>
+const C   = document.getElementById('c');
+const ctx = C.getContext('2d');
+const NW={CANVAS_W}, NH={CANVAS_H}, VW={m_w}, VH={m_h};
+const img = new Image();
+img.onload = () => ctx.drawImage(img, 0, 0, NW, NH);
+img.src = 'data:image/jpeg;base64,{b64_frame}';
+
+function pt(e) {{
+  const r = C.getBoundingClientRect();
+  const s = e.touches ? e.touches[0] : e;
+  return [(s.clientX - r.left) * (NW / r.width),
+          (s.clientY - r.top)  * (NH / r.height)];
+}}
+let drawing=false, sx=0, sy=0, box={{}}, done=false;
+function draw_box(x,y,w,h) {{
+  ctx.save();
+  ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]);
+  ctx.strokeRect(x,y,w,h);
+  ctx.fillStyle='rgba(245,158,11,0.12)'; ctx.fillRect(x,y,w,h);
+  ctx.restore();
+}}
+function redraw(ex,ey) {{
+  ctx.clearRect(0,0,NW,NH); ctx.drawImage(img,0,0,NW,NH);
+  draw_box(Math.min(sx,ex),Math.min(sy,ey),
+           Math.abs(ex-sx),Math.abs(ey-sy));
+}}
+function to_vid(cx,cy,ex,ey) {{
+  return {{
+    x: Math.round(Math.min(cx,ex)*VW/NW),
+    y: Math.round(Math.min(cy,ey)*VH/NH),
+    w: Math.round(Math.abs(ex-cx)*VW/NW),
+    h: Math.round(Math.abs(ey-cy)*VH/NH),
+  }};
+}}
+function set_label(b) {{
+  document.getElementById('lbl').innerText =
+    'ROI → x:'+b.x+' y:'+b.y+' w:'+b.w+' h:'+b.h;
+}}
+C.addEventListener('mousedown', e=>{{
+  [sx,sy]=pt(e); drawing=true; done=false; e.preventDefault(); }});
+C.addEventListener('mousemove', e=>{{
+  if(!drawing) return;
+  const [ex,ey]=pt(e); redraw(ex,ey);
+  set_label(to_vid(sx,sy,ex,ey)); e.preventDefault(); }});
+C.addEventListener('mouseup', e=>{{
+  if(!drawing) return; drawing=false;
+  const [ex,ey]=pt(e); redraw(ex,ey);
+  box=to_vid(sx,sy,ex,ey); set_label(box); done=true; e.preventDefault(); }});
+C.addEventListener('touchstart', e=>{{
+  [sx,sy]=pt(e); drawing=true; done=false; e.preventDefault(); }},{{passive:false}});
+C.addEventListener('touchmove', e=>{{
+  if(!drawing) return;
+  const [ex,ey]=pt(e); redraw(ex,ey); e.preventDefault(); }},{{passive:false}});
+C.addEventListener('touchend', e=>{{
+  if(!drawing) return; drawing=false;
+  const [ex,ey]=pt(e);
+  box=to_vid(sx,sy,ex,ey); set_label(box); done=true; e.preventDefault(); }},{{passive:false}});
+
+function confirm_roi() {{
+  if(!done || box.w<4 || box.h<4) {{ alert('Draw a larger box first.'); return; }}
+  const val = box.x+','+box.y+','+box.w+','+box.h;
+  // Write roi into page URL query param — Streamlit reads this on next rerun
+  const url = new URL(window.parent.location.href);
+  url.searchParams.set('roi', val);
+  window.parent.history.pushState({{}}, '', url);
+  // Also trigger a Streamlit rerun by clicking a hidden element
+  window.parent.dispatchEvent(new Event('popstate'));
+  document.getElementById('btn').className = 'ok';
+  document.getElementById('btn').innerText = '✅ ROI sent — click Confirm ROI below';
+}}
+</script>
+"""
+        components.html(canvas_html, height=CANVAS_H + 140, scrolling=False)
 
         # ── Confirm / Clear buttons ───────────────────────────────────────────
         col_confirm, col_clear = st.columns([3, 1])
         with col_confirm:
             if st.button("✅ Confirm ROI", use_container_width=True):
-                if pending_roi:
-                    st.session_state["confirmed_roi"] = pending_roi
-                    st.success(
-                        f"✅ ROI confirmed — x:{pending_roi[0]}  y:{pending_roi[1]}"
-                        f"  w:{pending_roi[2]}  h:{pending_roi[3]}"
-                    )
+                # Re-read query params fresh at button-press time
+                qp2 = st.query_params
+                if "roi" in qp2:
+                    try:
+                        parts = [int(v) for v in qp2["roi"].split(",")]
+                        if len(parts) == 4 and parts[2] >= 4 and parts[3] >= 4:
+                            st.session_state["confirmed_roi"] = tuple(parts)
+                            st.session_state["pending_roi"]   = tuple(parts)
+                            # Clear query param so it doesn't persist
+                            st.query_params.clear()
+                            st.success(
+                                f"✅ ROI confirmed — x:{parts[0]}  y:{parts[1]}"
+                                f"  w:{parts[2]}  h:{parts[3]}"
+                            )
+                        else:
+                            st.warning("ROI too small — draw a larger box.")
+                    except Exception:
+                        st.warning("Could not parse ROI. Please draw again.")
+                elif st.session_state.get("pending_roi"):
+                    # Already captured in a previous interaction
+                    st.session_state["confirmed_roi"] = st.session_state["pending_roi"]
+                    p = st.session_state["confirmed_roi"]
+                    st.success(f"✅ ROI confirmed — x:{p[0]}  y:{p[1]}  w:{p[2]}  h:{p[3]}")
                 else:
-                    st.warning("Draw a rectangle on the canvas above first.")
+                    st.warning("Draw a rectangle on the canvas first.")
         with col_clear:
             if st.button("🗑 Clear", use_container_width=True):
                 st.session_state["confirmed_roi"] = None
+                st.session_state["pending_roi"]   = None
+                st.query_params.clear()
 
-        # ── Overlay preview of confirmed ROI on frame ─────────────────────────
+        # ── Overlay preview ───────────────────────────────────────────────────
         confirmed = st.session_state.get("confirmed_roi")
         if confirmed:
             rx, ry, rw, rh = confirmed
             preview = first_frame.copy()
             overlay = preview.copy()
-            cv2.rectangle(overlay, (rx, ry), (rx + rw, ry + rh), (245, 158, 11), -1)
+            cv2.rectangle(overlay, (rx, ry), (rx+rw, ry+rh), (245, 158, 11), -1)
             preview = cv2.addWeighted(overlay, 0.18, preview, 0.82, 0)
-            cv2.rectangle(preview, (rx, ry), (rx + rw, ry + rh), (245, 158, 11), 2)
+            cv2.rectangle(preview, (rx, ry), (rx+rw, ry+rh), (245, 158, 11), 2)
             st.image(
                 cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
                 caption=f"Active ROI — x:{rx}  y:{ry}  w:{rw}  h:{rh}",
                 use_container_width=True,
             )
-
         # ══════════════════════════════════════════════════════════════════════
         #  STEP 3 — Vibration Analysis
         # ══════════════════════════════════════════════════════════════════════
