@@ -139,14 +139,8 @@ def make_plot(result: dict) -> plt.Figure:
     ax2.grid(color="#1e1e30", linestyle="--", linewidth=0.5)
     return fig
 
-
 def roi_canvas_html(b64_img: str, canvas_w: int, canvas_h: int,
                     vid_w: int, vid_h: int) -> str:
-    """
-    Canvas ROI picker that posts the selection via a Streamlit query-param trick:
-    clicking Confirm appends ?roi=x,y,w,h to the page URL which Streamlit reads
-    via st.query_params — no cross-frame DOM manipulation needed.
-    """
     return f"""
 <style>
   body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; }}
@@ -157,7 +151,7 @@ def roi_canvas_html(b64_img: str, canvas_w: int, canvas_h: int,
   #btn  {{
     background:linear-gradient(135deg,#7c3aed,#2563eb); color:#fff; border:none;
     border-radius:7px; font-family:'Syne',sans-serif; font-weight:700;
-    font-size:0.85rem; padding:6px 22px; cursor:pointer;
+    font-size:0.85rem; padding:6px 22px; cursor:pointer; margin-top:6px;
   }}
   #btn.ok {{ background:linear-gradient(135deg,#059669,#0284c7); }}
 </style>
@@ -196,39 +190,29 @@ function to_vid(cx,cy,ex,ey){{
   return {{
     x:Math.round(Math.min(cx,ex)*VW/NW), y:Math.round(Math.min(cy,ey)*VH/NH),
     w:Math.round(Math.abs(ex-cx)*VW/NW), h:Math.round(Math.abs(ey-cy)*VH/NH),
-    dx:Math.min(cx,ex), dy:Math.min(cy,ey),
-    dw:Math.abs(ex-cx), dh:Math.abs(ey-cy),
   }};
 }}
 C.addEventListener('mousedown', e=>{{ [sx,sy]=pt(e); drawing=true; done=false; e.preventDefault(); }});
 C.addEventListener('mousemove', e=>{{ if(!drawing)return; const[ex,ey]=pt(e); redraw(ex,ey);
   const b=to_vid(sx,sy,ex,ey); set_label(b.x,b.y,b.w,b.h); e.preventDefault(); }});
-C.addEventListener('mouseup',   e=>{{ if(!drawing)return; drawing=false;
+C.addEventListener('mouseup', e=>{{ if(!drawing)return; drawing=false;
   const[ex,ey]=pt(e); redraw(ex,ey); box=to_vid(sx,sy,ex,ey);
   set_label(box.x,box.y,box.w,box.h); done=true; e.preventDefault(); }});
 C.addEventListener('touchstart', e=>{{ [sx,sy]=pt(e); drawing=true; done=false; e.preventDefault(); }}, {{passive:false}});
-C.addEventListener('touchmove',  e=>{{ if(!drawing)return; const[ex,ey]=pt(e); redraw(ex,ey); e.preventDefault(); }}, {{passive:false}});
-C.addEventListener('touchend',   e=>{{ if(!drawing)return; drawing=false;
+C.addEventListener('touchmove', e=>{{ if(!drawing)return; const[ex,ey]=pt(e); redraw(ex,ey); e.preventDefault(); }}, {{passive:false}});
+C.addEventListener('touchend', e=>{{ if(!drawing)return; drawing=false;
   const[ex,ey]=pt(e); box=to_vid(sx,sy,ex,ey); set_label(box.x,box.y,box.w,box.h); done=true; e.preventDefault(); }}, {{passive:false}});
 
 function confirm_roi(){{
   if(!done||box.w<4||box.h<4){{ alert('Draw a larger box first.'); return; }}
   const val = box.x+','+box.y+','+box.w+','+box.h;
-  // Write into every text input in parent that has our sentinel aria-label
-  try {{
-    const inputs = window.parent.document.querySelectorAll('input[aria-label="roi_value_input"]');
-    inputs.forEach(inp => {{
-      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
-        .set.call(inp, val);
-      inp.dispatchEvent(new Event('input', {{bubbles:true}}));
-    }});
-  }} catch(err) {{ console.warn('parent DOM access failed', err); }}
+  // Send to parent via postMessage (works across sandbox boundaries)
+  window.parent.postMessage({{type:'roi_confirmed', value:val}}, '*');
   document.getElementById('btn').className='ok';
-  document.getElementById('btn').innerText='✅ ROI set — now click Confirm ROI button below';
+  document.getElementById('btn').innerText='✅ Sent! Now click Confirm ROI below';
 }}
 </script>
 """
-
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -377,7 +361,6 @@ else:
         st.session_state[k] = None
     st.info("Upload a video above, tune parameters in the sidebar, then click **Run Motion Magnification**.")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 2 — ROI canvas
 # ══════════════════════════════════════════════════════════════════════════════
@@ -391,13 +374,12 @@ if not mag_ready:
     st.markdown('<div class="step-badge locked" style="margin-top:6px">STEP 3 — Vibration Analysis · run magnification first</div>', unsafe_allow_html=True)
 else:
     st.markdown('<div class="step-badge done">STEP 2 — Draw ROI on Magnified Frame</div>', unsafe_allow_html=True)
-    st.markdown("Drag a box on the frame below to select the region for vibration analysis.")
+    st.markdown("Drag a box on the frame below, click **Confirm ROI** inside the canvas, then paste the coordinates and click **Confirm ROI** below.")
 
     m_w   = st.session_state["mag_vid_w"]
     m_h   = st.session_state["mag_vid_h"]
     m_fps = st.session_state["mag_vid_fps"]
 
-    # Extract first frame
     cap_m = cv2.VideoCapture(mag_path)
     ret_m, first_frame = cap_m.read()
     cap_m.release()
@@ -405,21 +387,30 @@ else:
     if not ret_m:
         st.warning("Could not read first frame of magnified video.")
     else:
-        # ── Canvas sizing: max 560px wide, maintain aspect ratio ──────────────
         CANVAS_W = min(560, m_w) if m_w > 0 else 560
         CANVAS_H = int(m_h * CANVAS_W / m_w) if m_w > 0 else 400
 
         _, buf = cv2.imencode(".jpg", first_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         b64_frame = base64.b64encode(buf.tobytes()).decode()
 
-        # ── Hidden text input: JS writes "x,y,w,h" here ──────────────────────
-        # Use a form so pressing Enter or the Confirm button below both work
-        roi_pending = st.text_input(
-            "roi_value_input",
-            key="roi_raw_input",
-            label_visibility="collapsed",
-            placeholder="ROI coordinates appear here after drawing — then click Confirm ROI",
-        )
+        # postMessage listener — writes received ROI into a visible text box
+        st.components.v1.html("""
+<script>
+window.addEventListener('message', function(e) {
+    if (e.data && e.data.type === 'roi_confirmed') {
+        // Find the roi paste input by its data-testid label and fill it
+        const inputs = window.parent.document.querySelectorAll('input[type="text"]');
+        inputs.forEach(inp => {
+            if (inp.placeholder && inp.placeholder.includes('Paste ROI')) {
+                Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
+                    .set.call(inp, e.data.value);
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+            }
+        });
+    }
+});
+</script>
+""", height=0)
 
         components.html(
             roi_canvas_html(b64_frame, CANVAS_W, CANVAS_H, m_w, m_h),
@@ -427,7 +418,14 @@ else:
             scrolling=False,
         )
 
-        # Confirm button — reads the text input and locks the ROI
+        st.info("👆 After clicking **Confirm ROI** in the canvas above, the coordinates will appear below. If they don't auto-fill, copy them manually from the canvas label.")
+
+        roi_text = st.text_input(
+            "ROI Coordinates",
+            key="roi_raw_input",
+            placeholder="Paste ROI here, e.g.: 120,45,300,200",
+        )
+
         col_confirm, col_clear = st.columns([3, 1])
         with col_confirm:
             if st.button("✅ Confirm ROI", use_container_width=True):
@@ -441,14 +439,13 @@ else:
                         else:
                             st.warning("ROI too small — draw a larger box.")
                     except ValueError:
-                        st.warning("Draw a box on the canvas first, then click Confirm ROI.")
+                        st.warning("Invalid format. Expected: x,y,w,h (e.g. 120,45,300,200)")
                 else:
                     st.warning("Draw a box on the canvas first, then click Confirm ROI.")
         with col_clear:
             if st.button("🗑 Clear", use_container_width=True):
                 st.session_state["confirmed_roi"] = None
 
-        # Show confirmed ROI preview
         confirmed = st.session_state.get("confirmed_roi")
         if confirmed:
             rx, ry, rw, rh = confirmed
@@ -463,7 +460,7 @@ else:
                 use_container_width=True,
             )
 
-        # ── STEP 3 ────────────────────────────────────────────────────────────
+        # ── STEP 3 ──────────────────────────────────────────────────────────
         st.markdown("---")
         st.markdown('<div class="step-badge done">STEP 3 — Vibration Analysis</div>', unsafe_allow_html=True)
 
@@ -480,7 +477,6 @@ else:
                     an_prog.progress(min(cur / tot, 1.0))
 
                 try:
-                    # Analysis runs on the magnified video file
                     result = analyze_vibration(
                         input_path=mag_path, roi=roi_tuple,
                         fps=m_fps, method=of_method,
@@ -493,7 +489,7 @@ else:
                     r1.metric("Dominant Freq", f"{result['dominant_hz']:.3f} Hz")
                     r2.metric("Period", f"{1/result['dominant_hz']:.3f} s" if result["dominant_hz"] > 0 else "—")
                     r3.metric("Amplitude",     f"{result['dominant_amp']:.4f} px")
-                    r4.metric("Frames",         str(len(result["motion"])))
+                    r4.metric("Frames",        str(len(result["motion"])))
 
                     fig = make_plot(result)
                     st.pyplot(fig, use_container_width=True)
@@ -521,7 +517,7 @@ else:
         else:
             if not st.session_state.get("confirmed_roi"):
                 st.info("Draw and confirm an ROI above, then click **Run Vibration Analysis**.")
-
+                
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown("""
