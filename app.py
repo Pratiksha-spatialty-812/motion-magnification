@@ -101,6 +101,7 @@ for key, default in [
     ("mag_vid_h",      0),
     ("mag_vid_fps",    0.0),
     ("roi_coords",     ""),
+    ("mag_bytes",      None),   # FIX 1: cache video bytes so player persists across reruns
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -188,16 +189,32 @@ def make_plot(result: dict) -> plt.Figure:
 # ── Helper: canvas ROI picker ──────────────────────────────────────────────────
 def roi_canvas_html(b64_img: str, canvas_w: int, canvas_h: int,
                     vid_w: int, vid_h: int) -> str:
+    """
+    FIX 2: canvas is always sized to exactly canvas_w × canvas_h pixels
+    (we pass a sane value ≤ 640).  CSS width:100% is removed so the canvas
+    never gets rescaled by the iframe, which broke the coordinate mapping.
+    Touch events are added for tablet/mobile support.
+    """
     return f"""
 <style>
-  body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; }}
-  canvas {{ display:block; cursor:crosshair; border-radius:10px;
-            border:2px solid #1e1e30; width:100%; height:auto; }}
+  body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; overflow-x:hidden; }}
+  #wrap {{ width:{canvas_w}px; max-width:100%; }}
+  canvas {{
+    display:block;
+    width:{canvas_w}px; height:{canvas_h}px;
+    max-width:100%;
+    cursor:crosshair;
+    border-radius:10px;
+    border:2px solid #1e1e30;
+    box-sizing:border-box;
+  }}
   #hint {{ font-size:0.72rem; color:#6b7280; margin:6px 0 8px; }}
-  #roi-label {{ font-size:0.78rem; color:#38bdf8; background:#13131f;
-                border:1px solid #1e1e30; border-radius:6px;
-                padding:5px 10px; display:inline-block;
-                min-width:280px; margin-bottom:8px; }}
+  #roi-label {{
+    font-size:0.78rem; color:#38bdf8; background:#13131f;
+    border:1px solid #1e1e30; border-radius:6px;
+    padding:5px 10px; display:inline-block;
+    min-width:280px; margin-bottom:8px; word-break:break-all;
+  }}
   #confirm-btn {{
     background:linear-gradient(135deg,#7c3aed,#2563eb); color:#fff;
     border:none; border-radius:8px; font-family:'Syne',sans-serif;
@@ -207,84 +224,148 @@ def roi_canvas_html(b64_img: str, canvas_w: int, canvas_h: int,
   #confirm-btn:hover {{ opacity:0.82; }}
   #confirm-btn.sent {{ background:linear-gradient(135deg,#059669,#0284c7); }}
 </style>
-<canvas id="c" width="{canvas_w}" height="{canvas_h}"></canvas>
-<div id="hint">Click and drag to draw ROI on the magnified frame, then click Confirm.</div>
-<div id="roi-label">No ROI drawn yet</div><br>
-<button id="confirm-btn" onclick="confirmROI()">✅ Confirm ROI</button>
+<div id="wrap">
+  <canvas id="c" width="{canvas_w}" height="{canvas_h}"></canvas>
+  <div id="hint">Click and drag to draw ROI on the magnified frame, then click Confirm.</div>
+  <div id="roi-label">No ROI drawn yet</div><br>
+  <button id="confirm-btn" onclick="confirmROI()">✅ Confirm ROI</button>
+</div>
 <script>
 const canvas = document.getElementById('c');
 const ctx    = canvas.getContext('2d');
-const img    = new Image();
-img.onload   = () => ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-img.src      = 'data:image/jpeg;base64,{b64_img}';
 
-const scaleX = {vid_w} / {canvas_w};
-const scaleY = {vid_h} / {canvas_h};
-let drawing=false, sx=0, sy=0, rect={{}}, confirmed=false;
+// Native canvas resolution (fixed, never changes)
+const NW = {canvas_w};
+const NH = {canvas_h};
+// Video resolution (for coordinate mapping)
+const VW = {vid_w};
+const VH = {vid_h};
 
-function drawBox(x,y,w,h) {{
+const img = new Image();
+img.onload = () => ctx.drawImage(img, 0, 0, NW, NH);
+img.src    = 'data:image/jpeg;base64,{b64_img}';
+
+// Map a mouse/touch client position → canvas pixel coords
+function clientToCanvas(cx, cy) {{
+  const r = canvas.getBoundingClientRect();
+  // CSS size may differ from native size if max-width kicks in
+  return [
+    (cx - r.left)  * (NW / r.width),
+    (cy - r.top)   * (NH / r.height),
+  ];
+}}
+
+let drawing = false, sx = 0, sy = 0, rect = {{}}, confirmed = false;
+
+function drawBox(x, y, w, h) {{
   ctx.save();
-  ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([6,3]);
-  ctx.strokeRect(x,y,w,h);
-  ctx.fillStyle='rgba(245,158,11,0.10)';
-  ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2; ctx.setLineDash([6, 3]);
+  ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = 'rgba(245,158,11,0.10)';
+  ctx.fillRect(x, y, w, h);
   ctx.restore();
 }}
-function redraw(cx,cy) {{
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  ctx.drawImage(img,0,0,canvas.width,canvas.height);
-  if (!drawing && confirmed) {{ drawBox(rect.dx,rect.dy,rect.dw,rect.dh); return; }}
-  drawBox(sx,sy,cx-sx,cy-sy);
+
+function redraw(cx, cy) {{
+  ctx.clearRect(0, 0, NW, NH);
+  ctx.drawImage(img, 0, 0, NW, NH);
+  if (!drawing && confirmed) {{ drawBox(rect.dx, rect.dy, rect.dw, rect.dh); return; }}
+  drawBox(sx, sy, cx - sx, cy - sy);
 }}
+
+function updateLabel(x, y, w, h) {{
+  document.getElementById('roi-label').innerText =
+    'ROI → x:' + x + '  y:' + y + '  w:' + w + '  h:' + h + ' px';
+}}
+
+// ── Mouse events ──────────────────────────────────────────────────────────────
 canvas.addEventListener('mousedown', e => {{
-  const r=canvas.getBoundingClientRect();
-  sx=(e.clientX-r.left)*(canvas.width/r.width);
-  sy=(e.clientY-r.top)*(canvas.height/r.height);
-  drawing=true; confirmed=false;
+  [sx, sy] = clientToCanvas(e.clientX, e.clientY);
+  drawing = true; confirmed = false;
+  e.preventDefault();
 }});
 canvas.addEventListener('mousemove', e => {{
   if (!drawing) return;
-  const r=canvas.getBoundingClientRect();
-  const cx=(e.clientX-r.left)*(canvas.width/r.width);
-  const cy=(e.clientY-r.top)*(canvas.height/r.height);
-  redraw(cx,cy);
-  document.getElementById('roi-label').innerText =
-    'ROI \u2192 x:'+Math.round(Math.min(sx,cx)*scaleX)+
-    '  y:'+Math.round(Math.min(sy,cy)*scaleY)+
-    '  w:'+Math.round(Math.abs(cx-sx)*scaleX)+
-    '  h:'+Math.round(Math.abs(cy-sy)*scaleY)+' px';
+  const [cx, cy] = clientToCanvas(e.clientX, e.clientY);
+  redraw(cx, cy);
+  updateLabel(
+    Math.round(Math.min(sx, cx) * VW / NW),
+    Math.round(Math.min(sy, cy) * VH / NH),
+    Math.round(Math.abs(cx - sx) * VW / NW),
+    Math.round(Math.abs(cy - sy) * VH / NH),
+  );
+  e.preventDefault();
 }});
 canvas.addEventListener('mouseup', e => {{
   if (!drawing) return;
-  drawing=false;
-  const r=canvas.getBoundingClientRect();
-  const ex=(e.clientX-r.left)*(canvas.width/r.width);
-  const ey=(e.clientY-r.top)*(canvas.height/r.height);
-  rect={{
-    dx:Math.min(sx,ex), dy:Math.min(sy,ey),
-    dw:Math.abs(ex-sx),  dh:Math.abs(ey-sy),
-    x:Math.round(Math.min(sx,ex)*scaleX),
-    y:Math.round(Math.min(sy,ey)*scaleY),
-    w:Math.round(Math.abs(ex-sx)*scaleX),
-    h:Math.round(Math.abs(ey-sy)*scaleY),
+  drawing = false;
+  const [ex, ey] = clientToCanvas(e.clientX, e.clientY);
+  rect = {{
+    dx: Math.min(sx, ex), dy: Math.min(sy, ey),
+    dw: Math.abs(ex - sx), dh: Math.abs(ey - sy),
+    x:  Math.round(Math.min(sx, ex) * VW / NW),
+    y:  Math.round(Math.min(sy, ey) * VH / NH),
+    w:  Math.round(Math.abs(ex - sx) * VW / NW),
+    h:  Math.round(Math.abs(ey - sy) * VH / NH),
   }};
-  confirmed=true; redraw(ex,ey);
+  confirmed = true;
+  redraw(ex, ey);
+  updateLabel(rect.x, rect.y, rect.w, rect.h);
+  e.preventDefault();
 }});
+
+// ── Touch events (mobile / tablet) ───────────────────────────────────────────
+canvas.addEventListener('touchstart', e => {{
+  const t = e.touches[0];
+  [sx, sy] = clientToCanvas(t.clientX, t.clientY);
+  drawing = true; confirmed = false;
+  e.preventDefault();
+}}, {{passive: false}});
+canvas.addEventListener('touchmove', e => {{
+  if (!drawing) return;
+  const t = e.touches[0];
+  const [cx, cy] = clientToCanvas(t.clientX, t.clientY);
+  redraw(cx, cy);
+  e.preventDefault();
+}}, {{passive: false}});
+canvas.addEventListener('touchend', e => {{
+  if (!drawing) return;
+  drawing = false;
+  const t = e.changedTouches[0];
+  const [ex, ey] = clientToCanvas(t.clientX, t.clientY);
+  rect = {{
+    dx: Math.min(sx, ex), dy: Math.min(sy, ey),
+    dw: Math.abs(ex - sx), dh: Math.abs(ey - sy),
+    x:  Math.round(Math.min(sx, ex) * VW / NW),
+    y:  Math.round(Math.min(sy, ey) * VH / NH),
+    w:  Math.round(Math.abs(ex - sx) * VW / NW),
+    h:  Math.round(Math.abs(ey - sy) * VH / NH),
+  }};
+  confirmed = true;
+  redraw(ex, ey);
+  updateLabel(rect.x, rect.y, rect.w, rect.h);
+  e.preventDefault();
+}}, {{passive: false}});
+
+// ── Confirm ───────────────────────────────────────────────────────────────────
 function confirmROI() {{
-  if (!confirmed || rect.w<4 || rect.h<4) {{ alert('Draw a larger ROI first.'); return; }}
-  const val=rect.x+','+rect.y+','+rect.w+','+rect.h;
-  const inputs=window.parent.document.querySelectorAll('input[type="text"]');
+  if (!confirmed || rect.w < 4 || rect.h < 4) {{
+    alert('Draw a larger ROI first.');
+    return;
+  }}
+  const val = rect.x + ',' + rect.y + ',' + rect.w + ',' + rect.h;
+  const inputs = window.parent.document.querySelectorAll('input[type="text"]');
   for (const inp of inputs) {{
-    if (inp.getAttribute('aria-label')==='__roi_hidden__') {{
-      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value')
+    if (inp.getAttribute('aria-label') === '__roi_hidden__') {{
+      Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')
         .set.call(inp, val);
-      inp.dispatchEvent(new Event('input',{{bubbles:true}}));
+      inp.dispatchEvent(new Event('input', {{bubbles: true}}));
       break;
     }}
   }}
-  const btn=document.getElementById('confirm-btn');
+  const btn = document.getElementById('confirm-btn');
   btn.classList.add('sent');
-  btn.innerText='\u2705 ROI Confirmed \u2014 scroll down and click Run Vibration Analysis';
+  btn.innerText = '✅ ROI Confirmed — scroll down and click Run Vibration Analysis';
 }}
 </script>
 """
@@ -335,7 +416,8 @@ if uploaded_file:
         if run_btn:
             # Reset downstream state when re-running
             st.session_state["magnified_path"] = None
-            st.session_state["roi_coords"] = ""
+            st.session_state["mag_bytes"]       = None
+            st.session_state["roi_coords"]      = ""
 
             output_path  = tmp_input_path.replace(".mp4", "_magnified.mp4")
             status_box   = st.empty()
@@ -370,6 +452,10 @@ if uploaded_file:
                 eta_box.empty()
                 status_box.success(f"✅ Done in {time.time()-t0:.1f}s — scroll down to analyse")
 
+                # FIX 1: read bytes once and cache them in session_state
+                with open(out_path, "rb") as vf:
+                    st.session_state["mag_bytes"] = vf.read()
+
                 st.session_state["magnified_path"] = out_path
                 st.session_state["mag_vid_w"]   = vid_w
                 st.session_state["mag_vid_h"]   = vid_h
@@ -379,15 +465,14 @@ if uploaded_file:
                 status_box.error(f"❌ Error: {e}")
                 progress_bar.empty(); eta_box.empty()
 
-        # Show magnified video (persists across reruns via session_state)
-        mag_path_now = st.session_state.get("magnified_path")
-        if mag_path_now and os.path.exists(mag_path_now):
-            with open(mag_path_now, "rb") as vf:
-                mag_bytes = vf.read()
-            st.video(mag_bytes)
+        # FIX 1: render video from cached bytes — survives reruns because it
+        # lives in session_state, not in the transient `if run_btn:` block.
+        cached_bytes = st.session_state.get("mag_bytes")
+        if cached_bytes:
+            st.video(cached_bytes)
             st.download_button(
                 "⬇️ Download Magnified Video",
-                data=mag_bytes,
+                data=cached_bytes,
                 file_name="magnified_output.mp4",
                 mime="video/mp4",
                 use_container_width=True,
@@ -446,8 +531,12 @@ else:
     if not ret_m:
         st.warning("Could not read first frame of magnified video.")
     else:
-        CANVAS_W = min(720, m_w) if m_w > 0 else 720
-        CANVAS_H = int(m_h * CANVAS_W / m_w) if m_w > 0 else 405
+        # FIX 2: cap canvas at 640 px wide so it fits comfortably inside the
+        # Streamlit column without needing horizontal scrolling.
+        # The canvas HTML element uses its exact pixel dimensions; CSS max-width
+        # handles the rare case where the column is even narrower (mobile).
+        CANVAS_W = min(640, m_w) if m_w > 0 else 640
+        CANVAS_H = int(m_h * CANVAS_W / m_w) if m_w > 0 else 360
 
         _, buf = cv2.imencode(".jpg", first_mag_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
         b64_frame = base64.b64encode(buf.tobytes()).decode()
@@ -455,9 +544,11 @@ else:
         # Invisible bridge input — JS writes coords here
         st.text_input("__roi_hidden__", key="roi_coords", label_visibility="hidden")
 
+        # FIX 2: give the iframe enough vertical space for canvas + controls.
+        # Extra 160 px accounts for hint text, label, button, and padding.
         components.html(
             roi_canvas_html(b64_frame, CANVAS_W, CANVAS_H, m_w, m_h),
-            height=CANVAS_H + 115,
+            height=CANVAS_H + 160,
             scrolling=False,
         )
 
