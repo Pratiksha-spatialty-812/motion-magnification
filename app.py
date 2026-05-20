@@ -158,9 +158,9 @@ with st.sidebar:
     n_levels = None if n_levels_raw == 0 else n_levels_raw
     alpha_curve = st.selectbox("Alpha Curve", list(ALPHA_CURVES.keys()), index=0)
     st.markdown("---")
-    of_method = st.selectbox("Optical Flow Method", ["farneback", "lucas_kanade"])
-
-
+    st.markdown("#### 🌊 Vibration Analysis")
+    st.markdown('<div class="param-label">Optical Flow Method</div>', unsafe_allow_html=True)
+    of_method = st.selectbox("Optical Flow Method", ["farneback", "lucas_kanade"], label_visibility="collapsed")
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 1
 # ══════════════════════════════════════════════════════════════════════════════
