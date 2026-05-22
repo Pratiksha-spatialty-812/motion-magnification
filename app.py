@@ -62,7 +62,10 @@ hr { border-color: #1e1e30 !important; }
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
 [data-testid="stToolbar"] { visibility: hidden; }
+[data-testid="stDecoration"] { visibility: hidden; }
 header { visibility: hidden; }
+.stDeployButton { visibility: hidden; }
+[data-testid="manage-app-button"] { visibility: hidden !important; }
 </style>
 """, unsafe_allow_html=True)
 
