@@ -59,7 +59,10 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 .stProgress > div > div { background: linear-gradient(90deg, #7c3aed, #38bdf8) !important; }
 [data-testid="stMetric"] { background: #13131f; border: 1px solid #1e1e30; border-radius: 10px; padding: 1rem; }
 hr { border-color: #1e1e30 !important; }
-#MainMenu { visibility: hidden; } footer { visibility: hidden; }
+#MainMenu { visibility: hidden; }
+footer { visibility: hidden; }
+[data-testid="stToolbar"] { visibility: hidden; }
+header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
