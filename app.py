@@ -20,7 +20,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap');
@@ -59,16 +58,32 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 .stProgress > div > div { background: linear-gradient(90deg, #7c3aed, #38bdf8) !important; }
 [data-testid="stMetric"] { background: #13131f; border: 1px solid #1e1e30; border-radius: 10px; padding: 1rem; }
 hr { border-color: #1e1e30 !important; }
-#MainMenu { visibility: hidden; }
-footer { visibility: hidden; }
-header { visibility: hidden; }
-[data-testid="stToolbar"] { visibility: hidden; }
-[data-testid="stDecoration"] { visibility: hidden; }
-[data-testid="stStatusWidget"] { visibility: hidden; }
-.stDeployButton { display: none; }
+#MainMenu { display: none !important; }
+footer { display: none !important; }
+header { display: none !important; }
+[data-testid="stToolbar"] { display: none !important; }
+[data-testid="stDecoration"] { display: none !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
 [data-testid="manage-app-button"] { display: none !important; }
-iframe[title="streamlit_analytics"] { display: none; }
+section[data-testid="stBottom"] { display: none !important; }
+.stDeployButton { display: none !important; }
 </style>
+<script>
+function removeElements() {
+    const selectors = [
+        '[data-testid="manage-app-button"]',
+        '[data-testid="stBottom"]',
+        '[data-testid="stToolbar"]',
+        'footer', 'header'
+    ];
+    selectors.forEach(sel => {
+        document.querySelectorAll(sel).forEach(el => el.remove());
+    });
+}
+removeElements();
+setTimeout(removeElements, 500);
+setTimeout(removeElements, 2000);
+</script>
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="main-title">🔬 Motion Magnification </div>', unsafe_allow_html=True)
