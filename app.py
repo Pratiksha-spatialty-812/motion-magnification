@@ -61,11 +61,13 @@ html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 hr { border-color: #1e1e30 !important; }
 #MainMenu { visibility: hidden; }
 footer { visibility: hidden; }
+header { visibility: hidden; }
 [data-testid="stToolbar"] { visibility: hidden; }
 [data-testid="stDecoration"] { visibility: hidden; }
-header { visibility: hidden; }
-.stDeployButton { visibility: hidden; }
-[data-testid="manage-app-button"] { visibility: hidden !important; }
+[data-testid="stStatusWidget"] { visibility: hidden; }
+.stDeployButton { display: none; }
+[data-testid="manage-app-button"] { display: none !important; }
+iframe[title="streamlit_analytics"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
