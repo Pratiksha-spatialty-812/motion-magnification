@@ -99,7 +99,7 @@ for k, v in [
     ("mag_vid_h",        0),
     ("mag_vid_fps",      0.0),
     ("confirmed_roi",    None),
-    ("pending_roi",      None),   # roi drawn but not yet confirmed
+    ("pending_roi",      None),
     ("last_upload_name", None),
 ]:
     if k not in st.session_state:
@@ -109,6 +109,12 @@ for k, v in [
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def to_browser_mp4_bytes(input_path: str) -> bytes:
+    """
+    FIX: Only used for the *original* preview video.
+    The magnified output is already H.264 from process_video() — no re-encode needed.
+    Uses subprocess.PIPE for stderr only; stdout goes to a temp file to avoid
+    buffering the entire video in RAM.
+    """
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         out_path = tmp.name
     try:
@@ -120,9 +126,9 @@ def to_browser_mp4_bytes(input_path: str) -> bytes:
             "-movflags", "+faststart",
             "-an",
             out_path,
-        ], capture_output=True, timeout=600)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
         if r.returncode != 0 or not os.path.exists(out_path):
-            st.error(f"ffmpeg failed: {r.stderr.decode()}")
+            st.error(f"ffmpeg failed: {r.stderr.decode(errors='replace')}")
             return b""
         with open(out_path, "rb") as f:
             return f.read()
@@ -181,9 +187,24 @@ with st.sidebar:
     n_levels = None if n_levels_raw == 0 else n_levels_raw
     alpha_curve = st.selectbox("Alpha Curve", list(ALPHA_CURVES.keys()), index=0)
     st.markdown("---")
+
+    # ── FIX: Resolution cap — key control for large/HD videos ────────────────
+    st.markdown("#### 📐 Resolution Cap")
+    st.markdown(
+        '<div class="param-label">Max dimension (px) — reduces RAM & /tmp usage</div>',
+        unsafe_allow_html=True,
+    )
+    res_options = {"No cap": None, "720p": 720, "480p": 480, "360p": 360}
+    res_label = st.selectbox("Max Dimension", list(res_options.keys()), index=1,
+                             label_visibility="collapsed")
+    max_dimension = res_options[res_label]
+
+    st.markdown("---")
     st.markdown("#### 🌊 Vibration Analysis")
     st.markdown('<div class="param-label">Optical Flow Method</div>', unsafe_allow_html=True)
-    of_method = st.selectbox("Optical Flow Method", ["farneback", "lucas_kanade"], label_visibility="collapsed")
+    of_method = st.selectbox("Optical Flow Method", ["farneback", "lucas_kanade"],
+                             label_visibility="collapsed")
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 1
 # ══════════════════════════════════════════════════════════════════════════════
@@ -198,12 +219,30 @@ vid_fps = 0.0
 
 if uploaded_file:
     fname = uploaded_file.name
+    file_size_mb = uploaded_file.size / (1024 * 1024)
+
+    # ── FIX: Warn early about large files ────────────────────────────────────
+    if file_size_mb > 50:
+        st.error(
+            f"⛔ File is {file_size_mb:.1f} MB — that's too large. "
+            "Please trim to under 30 s or reduce resolution before uploading."
+        )
+        st.stop()
+    elif file_size_mb > 15:
+        st.warning(
+            f"⚠️ Large file detected ({file_size_mb:.1f} MB). "
+            "Processing may be slow or fail on memory-constrained hosts. "
+            "Consider using the **720p** or **480p** resolution cap in the sidebar, "
+            "or trim your video to under 15 s."
+        )
 
     if st.session_state["last_upload_name"] != fname:
         raw_bytes = uploaded_file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(fname)[1]) as tmp:
             tmp.write(raw_bytes)
             st.session_state["orig_tmp_path"] = tmp.name
+        # FIX: don't keep raw_bytes in session state — frees RAM immediately
+        del raw_bytes
         st.session_state["last_upload_name"] = fname
         st.session_state["orig_vid_bytes"]   = None
         st.session_state["magnified_path"]   = None
@@ -233,13 +272,24 @@ if uploaded_file:
         orig_bytes = st.session_state["orig_vid_bytes"]
         if orig_bytes:
             st.video(orig_bytes, format="video/mp4")
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Resolution", f"{vid_w}×{vid_h}")
         m2.metric("FPS", f"{vid_fps:.0f}")
         m3.metric("Duration", f"{duration:.1f}s")
+        m4.metric("Size", f"{file_size_mb:.1f} MB")
 
     with right_up:
         st.markdown("**Magnified output**")
+
+        # Show what resolution will actually be processed
+        if max_dimension and max(vid_w, vid_h) > max_dimension:
+            scale = max_dimension / max(vid_w, vid_h)
+            proc_w = int(vid_w * scale) & ~1
+            proc_h = int(vid_h * scale) & ~1
+            st.caption(f"ℹ️ Will process at {proc_w}×{proc_h} (capped to {max_dimension}p)")
+        else:
+            st.caption(f"ℹ️ Will process at full {vid_w}×{vid_h}")
+
         run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
 
         if run_btn:
@@ -248,7 +298,9 @@ if uploaded_file:
             st.session_state["confirmed_roi"]  = None
             st.session_state["pending_roi"]    = None
 
-            raw_out  = tmp_input_path.replace(os.path.splitext(tmp_input_path)[1], "_mag_raw.mp4")
+            out_path = tmp_input_path.replace(
+                os.path.splitext(tmp_input_path)[1], "_magnified.mp4"
+            )
 
             status   = st.empty()
             prog     = st.progress(0)
@@ -256,36 +308,57 @@ if uploaded_file:
             t0 = time.time()
 
             def _cb(cur, tot):
-                prog.progress(cur / tot)
+                prog.progress(min(cur / tot, 1.0))
                 el = time.time() - t0
                 if cur > 1:
-                    eta_slot.caption(f"Frame {cur}/{tot} · ETA {(el/(cur/tot))*(1-cur/tot):.0f}s")
+                    eta_slot.caption(
+                        f"Frame {cur}/{tot} · ETA {(el/(cur/tot))*(1-cur/tot):.0f}s"
+                    )
 
             try:
-                status.info("🔄 Processing frames…")
-                out_path = process_video(
-                    input_path=tmp_input_path, output_path=raw_out,
-                    alpha=alpha, lambda_c=lambda_c, fl=fl, fh=fh, fps=fps_sidebar,
-                    progress_callback=_cb, n_levels=n_levels, alpha_curve=alpha_curve,
+                status.info("🔄 Processing frames… (piping directly to H.264)")
+                # FIX: process_video now writes H.264 directly via ffmpeg pipe —
+                #      no huge intermediate raw file, no second re-encode pass.
+                final_path = process_video(
+                    input_path=tmp_input_path,
+                    output_path=out_path,
+                    alpha=alpha,
+                    lambda_c=lambda_c,
+                    fl=fl,
+                    fh=fh,
+                    fps=fps_sidebar,
+                    progress_callback=_cb,
+                    n_levels=n_levels,
+                    alpha_curve=alpha_curve,
+                    max_dimension=max_dimension,   # ← NEW: resolution cap
                 )
-                prog.progress(1.0); eta_slot.empty()
+                prog.progress(1.0)
+                eta_slot.empty()
 
-                status.info("🎞 Encoding for browser playback…")
-                mag_bytes = to_browser_mp4_bytes(out_path)
-                if not mag_bytes:
-                    with open(out_path, "rb") as f:
-                        mag_bytes = f.read()
+                # FIX: output is already H.264 — just read bytes directly,
+                #      no third re-encode pass via to_browser_mp4_bytes()
+                status.info("📦 Reading output…")
+                with open(final_path, "rb") as f:
+                    mag_bytes = f.read()
+
+                # Compute actual output dimensions
+                cap_out = cv2.VideoCapture(final_path)
+                out_w = int(cap_out.get(cv2.CAP_PROP_FRAME_WIDTH))
+                out_h = int(cap_out.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                out_fps = cap_out.get(cv2.CAP_PROP_FPS)
+                cap_out.release()
 
                 st.session_state["mag_vid_bytes"]  = mag_bytes
-                st.session_state["magnified_path"] = out_path
-                st.session_state["mag_vid_w"]      = vid_w
-                st.session_state["mag_vid_h"]      = vid_h
-                st.session_state["mag_vid_fps"]    = vid_fps if vid_fps > 0 else float(fps_sidebar)
-                status.success(f"✅ Done in {time.time()-t0:.1f}s")
+                st.session_state["magnified_path"] = final_path
+                st.session_state["mag_vid_w"]      = out_w
+                st.session_state["mag_vid_h"]      = out_h
+                st.session_state["mag_vid_fps"]    = out_fps if out_fps > 0 else float(fps_sidebar)
+                status.success(f"✅ Done in {time.time()-t0:.1f}s — output: {out_w}×{out_h}")
 
             except Exception as e:
                 status.error(f"❌ {e}")
-                prog.empty(); eta_slot.empty()
+                prog.empty()
+                eta_slot.empty()
 
         mag_bytes = st.session_state.get("mag_vid_bytes")
         if mag_bytes:
@@ -334,7 +407,6 @@ else:
         _, buf = cv2.imencode(".jpg", first_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         b64_frame = base64.b64encode(buf.tobytes()).decode()
 
-        # ── Check if canvas posted ROI via query params ───────────────────────
         qp = st.query_params
         if "roi" in qp:
             try:
@@ -348,7 +420,6 @@ else:
         if pending:
             st.info(f"📐 Drawn — x:{pending[0]}  y:{pending[1]}  w:{pending[2]}  h:{pending[3]}  ← click Confirm ROI to lock")
 
-        # ── Canvas HTML — on Confirm writes ?roi=x,y,w,h to the URL ──────────
         canvas_html = f"""
 <style>
   body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; }}
@@ -430,11 +501,9 @@ C.addEventListener('touchend', e=>{{
 function confirm_roi() {{
   if(!done || box.w<4 || box.h<4) {{ alert('Draw a larger box first.'); return; }}
   const val = box.x+','+box.y+','+box.w+','+box.h;
-  // Write roi into page URL query param — Streamlit reads this on next rerun
   const url = new URL(window.parent.location.href);
   url.searchParams.set('roi', val);
   window.parent.history.pushState({{}}, '', url);
-  // Also trigger a Streamlit rerun by clicking a hidden element
   window.parent.dispatchEvent(new Event('popstate'));
   document.getElementById('btn').className = 'ok';
   document.getElementById('btn').innerText = '✅ ROI sent — click Confirm ROI below';
@@ -443,11 +512,9 @@ function confirm_roi() {{
 """
         components.html(canvas_html, height=CANVAS_H + 140, scrolling=False)
 
-        # ── Confirm / Clear buttons ───────────────────────────────────────────
         col_confirm, col_clear = st.columns([3, 1])
         with col_confirm:
             if st.button("✅ Confirm ROI", use_container_width=True):
-                # Re-read query params fresh at button-press time
                 qp2 = st.query_params
                 if "roi" in qp2:
                     try:
@@ -455,7 +522,6 @@ function confirm_roi() {{
                         if len(parts) == 4 and parts[2] >= 4 and parts[3] >= 4:
                             st.session_state["confirmed_roi"] = tuple(parts)
                             st.session_state["pending_roi"]   = tuple(parts)
-                            # Clear query param so it doesn't persist
                             st.query_params.clear()
                             st.success(
                                 f"✅ ROI confirmed — x:{parts[0]}  y:{parts[1]}"
@@ -466,7 +532,6 @@ function confirm_roi() {{
                     except Exception:
                         st.warning("Could not parse ROI. Please draw again.")
                 elif st.session_state.get("pending_roi"):
-                    # Already captured in a previous interaction
                     st.session_state["confirmed_roi"] = st.session_state["pending_roi"]
                     p = st.session_state["confirmed_roi"]
                     st.success(f"✅ ROI confirmed — x:{p[0]}  y:{p[1]}  w:{p[2]}  h:{p[3]}")
@@ -478,7 +543,6 @@ function confirm_roi() {{
                 st.session_state["pending_roi"]   = None
                 st.query_params.clear()
 
-        # ── Overlay preview ───────────────────────────────────────────────────
         confirmed = st.session_state.get("confirmed_roi")
         if confirmed:
             rx, ry, rw, rh = confirmed
@@ -492,6 +556,7 @@ function confirm_roi() {{
                 caption=f"Active ROI — x:{rx}  y:{ry}  w:{rw}  h:{rh}",
                 use_container_width=True,
             )
+
         # ══════════════════════════════════════════════════════════════════════
         #  STEP 3 — Vibration Analysis
         # ══════════════════════════════════════════════════════════════════════
