@@ -92,7 +92,7 @@ st.markdown("---")
 # ── Session state ──────────────────────────────────────────────────────────────
 for k, v in [
     ("orig_tmp_path",    None),
-    ("orig_vid_bytes",   None),
+    ("orig_vid_bytes",   None),   # None = not yet prepared; b"" = ffmpeg failed
     ("magnified_path",   None),
     ("mag_vid_bytes",    None),
     ("mag_vid_w",        0),
@@ -110,36 +110,83 @@ for k, v in [
 
 def to_browser_mp4_bytes(input_path: str) -> bytes:
     """
-    FIX: Only used for the *original* preview video.
-    The magnified output is already H.264 from process_video() — no re-encode needed.
-    Uses subprocess.PIPE for stderr only; stdout goes to a temp file to avoid
-    buffering the entire video in RAM.
+    Re-encode the original uploaded video to a browser-compatible H.264 MP4
+    for the st.video() preview widget.
+
+    Fixes applied vs previous version:
+    ① stderr written to a temp file — avoids pipe-buffer deadlock on large/HD videos
+      where ffmpeg produces thousands of progress lines.
+    ② Return-value validated with getsize() > 0, not just exists() — previously a
+      0-byte output file was silently returned as b"", which made st.video() crash
+      on the next Streamlit rerun.
+    ③ -ignore_editlist 1 added — some phone MP4s have edit-list atoms that confuse
+      ffmpeg's dimension calculation, producing wrong even-rounding in the scale filter.
+    ④ autorotate is left ON (ffmpeg default) so portrait videos display correctly in
+      the preview; magnify.py handles rotation independently with ffprobe.
     """
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        out_path = tmp.name
+    # Temp file for ffmpeg stderr so we can report errors without pipe deadlock
+    stderr_tmp = None
+    out_path = None
     try:
-        r = subprocess.run([
-            "ffmpeg", "-y", "-i", input_path,
-            "-vcodec", "libx264", "-crf", "23", "-preset", "fast",
-            "-pix_fmt", "yuv420p",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-movflags", "+faststart",
-            "-an",
-            out_path,
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
-        if r.returncode != 0 or not os.path.exists(out_path):
-            st.error(f"ffmpeg failed: {r.stderr.decode(errors='replace')}")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            out_path = tmp.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False
+        ) as etmp:
+            stderr_tmp = etmp.name
+
+        with open(stderr_tmp, "wb") as ef:
+            r = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-ignore_editlist", "1",   # FIX ③ — edit-list / dimension confusion
+                    "-i", input_path,
+                    "-vcodec", "libx264",
+                    "-crf", "23",
+                    "-preset", "fast",
+                    "-pix_fmt", "yuv420p",
+                    # FIX ① — scale filter: trunc to even, minimum 2 so we never get 0
+                    "-vf", "scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2)",
+                    "-movflags", "+faststart",
+                    "-an",
+                    out_path,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=ef,          # FIX ① — file, not PIPE → no deadlock
+                timeout=600,
+            )
+
+        # FIX ② — validate output is a real non-empty file
+        output_ok = (
+            r.returncode == 0
+            and os.path.exists(out_path)
+            and os.path.getsize(out_path) > 0
+        )
+        if not output_ok:
+            with open(stderr_tmp, "r", errors="replace") as ef:
+                err_text = ef.read()[-2000:]   # last 2000 chars is enough
+            st.error(
+                f"ffmpeg failed (exit {r.returncode}) while preparing preview.\n\n"
+                f"```\n{err_text}\n```"
+            )
             return b""
+
         with open(out_path, "rb") as f:
             return f.read()
+
     except FileNotFoundError:
         st.error("ffmpeg not found. Add `ffmpeg` to packages.txt in your repo root.")
         return b""
+    except subprocess.TimeoutExpired:
+        st.error("ffmpeg timed out while preparing preview (>600s). Try a shorter clip.")
+        return b""
     finally:
-        try:
-            os.unlink(out_path)
-        except OSError:
-            pass
+        for p in (out_path, stderr_tmp):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
 
 def make_plot(result: dict) -> plt.Figure:
@@ -188,7 +235,6 @@ with st.sidebar:
     alpha_curve = st.selectbox("Alpha Curve", list(ALPHA_CURVES.keys()), index=0)
     st.markdown("---")
 
-    # ── FIX: Resolution cap — key control for large/HD videos ────────────────
     st.markdown("#### 📐 Resolution Cap")
     st.markdown(
         '<div class="param-label">Max dimension (px) — reduces RAM & /tmp usage</div>',
@@ -221,17 +267,17 @@ if uploaded_file:
     fname = uploaded_file.name
     file_size_mb = uploaded_file.size / (1024 * 1024)
 
-    # Streamlit supports uploads up to 200 MB — no size restrictions needed here
+    # Streamlit supports uploads up to 200 MB — no artificial size limit here
 
     if st.session_state["last_upload_name"] != fname:
         raw_bytes = uploaded_file.read()
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(fname)[1]) as tmp:
             tmp.write(raw_bytes)
             st.session_state["orig_tmp_path"] = tmp.name
-        # FIX: don't keep raw_bytes in session state — frees RAM immediately
-        del raw_bytes
+        del raw_bytes                                 # free RAM immediately
         st.session_state["last_upload_name"] = fname
-        st.session_state["orig_vid_bytes"]   = None
+        # Reset ALL derived state for the new file
+        st.session_state["orig_vid_bytes"]   = None  # None = needs preparation
         st.session_state["magnified_path"]   = None
         st.session_state["mag_vid_bytes"]    = None
         st.session_state["confirmed_roi"]    = None
@@ -239,9 +285,15 @@ if uploaded_file:
 
     tmp_input_path = st.session_state["orig_tmp_path"]
 
+    # Prepare original video for browser playback (only once per upload)
+    # orig_vid_bytes == None  → not yet prepared → run ffmpeg
+    # orig_vid_bytes == b""   → ffmpeg failed    → show error, don't retry
+    # orig_vid_bytes == bytes → ready            → use it
     if st.session_state["orig_vid_bytes"] is None:
         with st.spinner("Preparing original video for playback…"):
             b = to_browser_mp4_bytes(tmp_input_path)
+            # Store b even if it is b"" so we don't retry on every rerun;
+            # the error was already shown inside to_browser_mp4_bytes().
             st.session_state["orig_vid_bytes"] = b
 
     cap = cv2.VideoCapture(tmp_input_path)
@@ -257,8 +309,15 @@ if uploaded_file:
     with left_up:
         st.markdown("**Original**")
         orig_bytes = st.session_state["orig_vid_bytes"]
+        # FIX ③ — only call st.video() when we actually have video bytes;
+        # st.video(b"") raises a Streamlit exception that crashes the whole app.
         if orig_bytes:
             st.video(orig_bytes, format="video/mp4")
+        else:
+            st.warning(
+                "⚠️ Preview unavailable — ffmpeg could not re-encode the original video. "
+                "The file is still uploaded and can be processed below."
+            )
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Resolution", f"{vid_w}×{vid_h}")
         m2.metric("FPS", f"{vid_fps:.0f}")
@@ -268,7 +327,6 @@ if uploaded_file:
     with right_up:
         st.markdown("**Magnified output**")
 
-        # Show what resolution will actually be processed
         if max_dimension and max(vid_w, vid_h) > max_dimension:
             scale = max_dimension / max(vid_w, vid_h)
             proc_w = int(vid_w * scale) & ~1
@@ -304,8 +362,6 @@ if uploaded_file:
 
             try:
                 status.info("🔄 Processing frames… (piping directly to H.264)")
-                # FIX: process_video now writes H.264 directly via ffmpeg pipe —
-                #      no huge intermediate raw file, no second re-encode pass.
                 final_path = process_video(
                     input_path=tmp_input_path,
                     output_path=out_path,
@@ -317,21 +373,20 @@ if uploaded_file:
                     progress_callback=_cb,
                     n_levels=n_levels,
                     alpha_curve=alpha_curve,
-                    max_dimension=max_dimension,   # ← NEW: resolution cap
+                    max_dimension=max_dimension,
                 )
                 prog.progress(1.0)
                 eta_slot.empty()
 
-                # FIX: output is already H.264 — just read bytes directly,
-                #      no third re-encode pass via to_browser_mp4_bytes()
+                # Output is already H.264 from process_video — read directly,
+                # no third re-encode pass needed.
                 status.info("📦 Reading output…")
                 with open(final_path, "rb") as f:
                     mag_bytes = f.read()
 
-                # Compute actual output dimensions
                 cap_out = cv2.VideoCapture(final_path)
-                out_w = int(cap_out.get(cv2.CAP_PROP_FRAME_WIDTH))
-                out_h = int(cap_out.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                out_w   = int(cap_out.get(cv2.CAP_PROP_FRAME_WIDTH))
+                out_h   = int(cap_out.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 out_fps = cap_out.get(cv2.CAP_PROP_FPS)
                 cap_out.release()
 
