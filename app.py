@@ -221,20 +221,7 @@ if uploaded_file:
     fname = uploaded_file.name
     file_size_mb = uploaded_file.size / (1024 * 1024)
 
-    # ── FIX: Warn early about large files ────────────────────────────────────
-    if file_size_mb > 50:
-        st.error(
-            f"⛔ File is {file_size_mb:.1f} MB — that's too large. "
-            "Please trim to under 30 s or reduce resolution before uploading."
-        )
-        st.stop()
-    elif file_size_mb > 15:
-        st.warning(
-            f"⚠️ Large file detected ({file_size_mb:.1f} MB). "
-            "Processing may be slow or fail on memory-constrained hosts. "
-            "Consider using the **720p** or **480p** resolution cap in the sidebar, "
-            "or trim your video to under 15 s."
-        )
+    # Streamlit supports uploads up to 200 MB — no size restrictions needed here
 
     if st.session_state["last_upload_name"] != fname:
         raw_bytes = uploaded_file.read()
