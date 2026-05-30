@@ -32,29 +32,17 @@ def reconPyr(pyr):
 
 
 ALPHA_CURVES = {
-    "auto":      None,          # original spatial-frequency-based attenuation
-    "flat":      "flat",        # same alpha at every level
-    "linear":    "linear",      # ramps from 0 at coarse → alpha at fine
-    "quadratic": "quadratic",   # emphasises fine detail more aggressively
-    "inverse":   "inverse",     # opposite: coarse levels get more weight
+    "auto":      None,
+    "flat":      "flat",
+    "linear":    "linear",
+    "quadratic": "quadratic",
+    "inverse":   "inverse",
 }
 
 
 class Magnify(object):
     def __init__(self, img1, alpha, lambda_c, fl, fh, samplingRate,
                  n_levels=None, alpha_curve="auto"):
-        """
-        Parameters
-        ----------
-        img1        : first BGR frame (uint8)
-        alpha       : magnification strength
-        lambda_c    : spatial wavelength cutoff (pixels)
-        fl / fh     : temporal bandpass bounds (Hz)
-        samplingRate: video fps
-        n_levels    : number of Laplacian pyramid levels (None = pyrtools default)
-        alpha_curve : how alpha is distributed across pyramid levels
-                      one of "auto", "flat", "linear", "quadratic", "inverse"
-        """
         [low_a, low_b] = signal.butter(1, fl / samplingRate, 'low')
         [high_a, high_b] = signal.butter(1, fh / samplingRate, 'low')
 
@@ -70,7 +58,6 @@ class Magnify(object):
             py1._build_pyr()
             pyramid_1 = list(py1.pyr_coeffs.values())
 
-            # optionally truncate / pad levels
             if n_levels is not None:
                 n_levels_clamped = max(1, min(n_levels, len(pyramid_1)))
                 pyramid_1 = pyramid_1[:n_levels_clamped]
@@ -95,8 +82,7 @@ class Magnify(object):
         self.delta  = self.lambda_c / 8.0 / (1 + self.alpha)
 
     def _level_alpha(self, l, n_levels):
-        """Return effective alpha for pyramid level l (0 = finest)."""
-        t = l / max(n_levels - 1, 1)          # 0 (finest) … 1 (coarsest)
+        t = l / max(n_levels - 1, 1)
         curve = self.alpha_curve
         if curve == "flat":
             return self.alpha
@@ -107,7 +93,7 @@ class Magnify(object):
         elif curve == "inverse":
             return self.alpha * t
         else:
-            return None                        # "auto" — use original spatial logic
+            return None
 
     def process_frame(self, img2):
         img2 = img_as_float(img2)
@@ -119,7 +105,7 @@ class Magnify(object):
             full_pyr = list(py2.pyr_coeffs.values())
 
             n_levels = len(self.pyramids[c])
-            pyr = full_pyr[:n_levels]           # match stored depth
+            pyr = full_pyr[:n_levels]
 
             for u in range(n_levels):
                 self.lowpass1[c][u] = (
@@ -147,7 +133,6 @@ class Magnify(object):
                 if l == len(filtered) - 1 or l == 0:
                     filtered[l] = np.zeros_like(filtered[l])
                 elif custom_alpha is None:
-                    # original auto spatial-frequency attenuation
                     currAlpha = lambd / delta / 8.0 - 1
                     currAlpha *= exaggeration_factor
                     if currAlpha > self.alpha:
@@ -168,31 +153,8 @@ class Magnify(object):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Video processing
+#  FIX: Direct ffmpeg pipe — no intermediate raw file written to disk
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _remux_h264(src_path: str, dst_path: str) -> bool:
-    """Re-encode src (mp4v) to H.264 using ffmpeg so browsers can play it."""
-    try:
-        result = subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-i", src_path,
-                "-vcodec", "libx264",
-                "-crf", "23",
-                "-preset", "fast",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                dst_path,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=300,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
 
 def process_video(
     input_path,
@@ -205,101 +167,134 @@ def process_video(
     progress_callback=None,
     n_levels=None,
     alpha_curve="auto",
+    max_dimension=None,   # e.g. 720 — downscale if larger
 ):
     """
     Process a video file with motion magnification.
 
+    Key fix: frames are piped DIRECTLY into ffmpeg (libx264) — no huge
+    intermediate raw .mp4 file is written to disk, saving hundreds of MB
+    of /tmp space on memory-constrained hosts (Streamlit Cloud etc.).
+
+    Parameters
+    ----------
+    max_dimension : int or None
+        If set, the larger of (width, height) is capped at this value before
+        processing.  Useful for high-res uploads that would otherwise exhaust
+        RAM / /tmp.  e.g. 720 keeps most detail while cutting memory ~4×.
+
     Returns
     -------
-    str : path of the final (browser-playable) output file
+    str : path of the final (browser-playable H.264) output file
     """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {input_path}")
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # Write raw frames with mp4v first (universally writable via OpenCV)
-    raw_path = output_path.replace(".mp4", "_raw.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(raw_path, fourcc, fps, (w, h))
-
-    ret, img1 = cap.read()
-    if not ret:
-        cap.release(); out.release()
-        raise ValueError("Failed to read first frame from video.")
-
-    magnifier = Magnify(
-        img1, alpha, lambda_c, fl, fh, fps,
-        n_levels=n_levels,
-        alpha_curve=alpha_curve,
-    )
-    out.write(img1)
-
-    frame_count = 1
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        out.write(magnifier.process_frame(frame))
-        frame_count += 1
-        if progress_callback:
-            progress_callback(frame_count, total_frames)
-
-    cap.release()
-    out.release()
-
-    # Re-encode to H.264 so st.video() can play it inline
-    if _remux_h264(raw_path, output_path):
-        try:
-            os.remove(raw_path)
-        except OSError:
-            pass
-        return output_path
+    # ── Optional downscale ────────────────────────────────────────────────────
+    if max_dimension and max(orig_w, orig_h) > max_dimension:
+        scale = max_dimension / max(orig_w, orig_h)
+        # ffmpeg needs even dimensions for yuv420p
+        w = int(orig_w * scale) & ~1
+        h = int(orig_h * scale) & ~1
     else:
-        # ffmpeg not available – fall back to raw file
+        w = orig_w & ~1   # ensure even for yuv420p
+        h = orig_h & ~1
+
+    # ── Spin up ffmpeg, reading raw BGR frames from stdin ────────────────────
+    ffmpeg_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-s", f"{w}x{h}",
+        "-pix_fmt", "bgr24",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-vcodec", "libx264",
+        "-crf", "23",
+        "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    try:
+        ffmpeg_proc = subprocess.Popen(
+            ffmpeg_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,   # capture errors only (not stdout)
+        )
+    except FileNotFoundError:
+        cap.release()
+        raise RuntimeError(
+            "ffmpeg not found. Add `ffmpeg` to packages.txt in your repo root."
+        )
+
+    def _write_frame(frame):
+        """Resize if needed, then pipe raw bytes to ffmpeg."""
+        if frame.shape[1] != w or frame.shape[0] != h:
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        ffmpeg_proc.stdin.write(frame.tobytes())
+
+    try:
+        ret, img1 = cap.read()
+        if not ret:
+            raise ValueError("Failed to read first frame from video.")
+
+        magnifier = Magnify(
+            img1 if (img1.shape[1] == w and img1.shape[0] == h)
+                else cv2.resize(img1, (w, h), interpolation=cv2.INTER_AREA),
+            alpha, lambda_c, fl, fh, fps,
+            n_levels=n_levels,
+            alpha_curve=alpha_curve,
+        )
+        _write_frame(img1)
+
+        frame_count = 1
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            processed = magnifier.process_frame(
+                frame if (frame.shape[1] == w and frame.shape[0] == h)
+                      else cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            )
+            _write_frame(processed)
+            frame_count += 1
+            if progress_callback:
+                progress_callback(frame_count, total_frames)
+
+    finally:
+        cap.release()
         try:
-            os.rename(raw_path, output_path)
-        except OSError:
+            ffmpeg_proc.stdin.close()
+        except BrokenPipeError:
             pass
-        return output_path
+        _, stderr_bytes = ffmpeg_proc.communicate()
+        if ffmpeg_proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg encoding failed:\n{stderr_bytes.decode(errors='replace')}"
+            )
+
+    return output_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ROI optical-flow + FFT vibration analysis
+#  ROI optical-flow + FFT vibration analysis  (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_vibration(
     input_path: str,
-    roi: tuple,           # (x, y, w, h) in pixels
+    roi: tuple,
     fps: float,
-    method: str = "farneback",   # "farneback" | "lucas_kanade"
+    method: str = "farneback",
     progress_callback=None,
 ) -> dict:
-    """
-    Extract per-frame motion magnitude inside *roi*, then compute FFT to find
-    dominant vibration frequencies.
-
-    Parameters
-    ----------
-    input_path : path to source video
-    roi        : (x, y, w, h) bounding box
-    fps        : frames per second
-    method     : optical-flow method
-    progress_callback : callable(current, total)
-
-    Returns
-    -------
-    dict with keys:
-        times       – 1-D array, seconds
-        motion      – 1-D array, mean optical-flow magnitude per frame (px/frame)
-        freqs       – FFT frequency axis (Hz), positive half
-        power       – FFT power spectrum (magnitude²)
-        dominant_hz – frequency with highest power (Hz)
-        dominant_amp– amplitude at dominant frequency
-    """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {input_path}")
@@ -317,7 +312,6 @@ def analyze_vibration(
         return cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
 
     prev_gray = crop_gray(prev_frame)
-
     motion_signal = []
     frame_idx = 1
 
@@ -343,16 +337,13 @@ def analyze_vibration(
 
         if method == "farneback":
             flow = cv2.calcOpticalFlowFarneback(
-                prev_gray, curr_gray,
-                None,
+                prev_gray, curr_gray, None,
                 pyr_scale=0.5, levels=3, winsize=13,
-                iterations=3, poly_n=5, poly_sigma=1.2,
-                flags=0,
+                iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
             )
             mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
             motion_signal.append(float(mag.mean()))
-
-        else:  # lucas_kanade
+        else:
             if p0 is None or len(p0) == 0:
                 motion_signal.append(0.0)
             else:
@@ -379,17 +370,12 @@ def analyze_vibration(
     motion = np.array(motion_signal, dtype=float)
     N = len(motion)
     times = np.arange(N) / fps
-
-    # Remove DC offset before FFT
     motion_ac = motion - motion.mean()
-
-    # Apply Hanning window to reduce spectral leakage
     window = np.hanning(N)
     fft_vals = np.fft.rfft(motion_ac * window)
     freqs = np.fft.rfftfreq(N, d=1.0 / fps)
     power = (np.abs(fft_vals) ** 2) / N
 
-    # Ignore DC bin
     if len(freqs) > 1:
         freqs = freqs[1:]
         power = power[1:]
