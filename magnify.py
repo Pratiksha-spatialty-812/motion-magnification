@@ -153,7 +153,52 @@ class Magnify(object):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FIX: Direct ffmpeg pipe — no intermediate raw file written to disk
+#  Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _even(n):
+    """Round down to nearest even number, minimum 2."""
+    return max(2, int(n) & ~1)
+
+
+def _detect_rotation(input_path: str) -> int:
+    """
+    Read the video stream's rotation tag via ffprobe.
+    Returns 0, 90, 180, or 270.
+    Phones shoot portrait video with rotate=90 or rotate=270 — OpenCV ignores this.
+    """
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream_tags=rotate",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                input_path,
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        val = probe.stdout.strip()
+        if val:
+            return int(val) % 360
+    except Exception:
+        pass
+    return 0
+
+
+def _apply_rotation(frame: np.ndarray, rot: int) -> np.ndarray:
+    """Rotate a BGR frame to match EXIF/container orientation."""
+    if rot == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif rot == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    elif rot == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Video processing  — direct ffmpeg pipe, portrait-safe
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_video(
@@ -167,45 +212,55 @@ def process_video(
     progress_callback=None,
     n_levels=None,
     alpha_curve="auto",
-    max_dimension=None,   # e.g. 720 — downscale if larger
+    max_dimension=None,
 ):
     """
     Process a video file with motion magnification.
 
-    Key fix: frames are piped DIRECTLY into ffmpeg (libx264) — no huge
-    intermediate raw .mp4 file is written to disk, saving hundreds of MB
-    of /tmp space on memory-constrained hosts (Streamlit Cloud etc.).
-
-    Parameters
-    ----------
-    max_dimension : int or None
-        If set, the larger of (width, height) is capped at this value before
-        processing.  Useful for high-res uploads that would otherwise exhaust
-        RAM / /tmp.  e.g. 720 keeps most detail while cutting memory ~4×.
-
-    Returns
-    -------
-    str : path of the final (browser-playable H.264) output file
+    Fixes vs original:
+    - Frames piped directly to ffmpeg (libx264) — no huge intermediate raw file.
+    - EXIF/container rotation detected via ffprobe and baked into pixel data,
+      so portrait videos from phones stay portrait in the output.
+    - Even-dimension enforcement never produces 0.
+    - First frame written to pipe is the same prepared (rotated+resized) frame
+      that Magnify was initialised with.
     """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {input_path}")
 
-    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    # ── Optional downscale ────────────────────────────────────────────────────
+    # ── Detect rotation BEFORE computing target dimensions ───────────────────
+    rotation = _detect_rotation(input_path)
+
+    # After applying rotation the logical frame dimensions may be swapped
+    if rotation in (90, 270):
+        orig_w, orig_h = raw_h, raw_w   # portrait phone video
+    else:
+        orig_w, orig_h = raw_w, raw_h
+
+    # ── Optional downscale (applied to post-rotation dimensions) ─────────────
     if max_dimension and max(orig_w, orig_h) > max_dimension:
         scale = max_dimension / max(orig_w, orig_h)
-        # ffmpeg needs even dimensions for yuv420p
-        w = int(orig_w * scale) & ~1
-        h = int(orig_h * scale) & ~1
+        w = _even(orig_w * scale)
+        h = _even(orig_h * scale)
     else:
-        w = orig_w & ~1   # ensure even for yuv420p
-        h = orig_h & ~1
+        w = _even(orig_w)
+        h = _even(orig_h)
 
-    # ── Spin up ffmpeg, reading raw BGR frames from stdin ────────────────────
+    # ── Prepare every frame: rotate then resize to (w, h) ───────────────────
+    def _prepare(frame: np.ndarray) -> np.ndarray:
+        if rotation:
+            frame = _apply_rotation(frame, rotation)
+        fh_fr, fw_fr = frame.shape[:2]
+        if fw_fr != w or fh_fr != h:
+            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+        return frame
+
+    # ── Spin up ffmpeg — raw BGR stdin → H.264 output ────────────────────────
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo",
@@ -219,6 +274,9 @@ def process_video(
         "-preset", "fast",
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
+        # Rotation has been baked in — clear any residual rotation tag
+        # so players don't double-rotate the output.
+        "-metadata:s:v:0", "rotate=0",
         output_path,
     ]
 
@@ -227,7 +285,7 @@ def process_video(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,   # capture errors only (not stdout)
+            stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
         cap.release()
@@ -235,36 +293,29 @@ def process_video(
             "ffmpeg not found. Add `ffmpeg` to packages.txt in your repo root."
         )
 
-    def _write_frame(frame):
-        """Resize if needed, then pipe raw bytes to ffmpeg."""
-        if frame.shape[1] != w or frame.shape[0] != h:
-            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-        ffmpeg_proc.stdin.write(frame.tobytes())
-
     try:
-        ret, img1 = cap.read()
+        ret, raw1 = cap.read()
         if not ret:
             raise ValueError("Failed to read first frame from video.")
 
+        img1 = _prepare(raw1)   # rotate + resize first frame
+
         magnifier = Magnify(
-            img1 if (img1.shape[1] == w and img1.shape[0] == h)
-                else cv2.resize(img1, (w, h), interpolation=cv2.INTER_AREA),
+            img1,                   # Magnify sees the final w×h frame
             alpha, lambda_c, fl, fh, fps,
             n_levels=n_levels,
             alpha_curve=alpha_curve,
         )
-        _write_frame(img1)
+        ffmpeg_proc.stdin.write(img1.tobytes())   # pipe the same prepared frame
 
         frame_count = 1
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            processed = magnifier.process_frame(
-                frame if (frame.shape[1] == w and frame.shape[0] == h)
-                      else cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-            )
-            _write_frame(processed)
+            prepared  = _prepare(frame)
+            processed = magnifier.process_frame(prepared)
+            ffmpeg_proc.stdin.write(processed.tobytes())
             frame_count += 1
             if progress_callback:
                 progress_callback(frame_count, total_frames)
@@ -285,7 +336,7 @@ def process_video(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  ROI optical-flow + FFT vibration analysis  (unchanged)
+#  ROI optical-flow + FFT vibration analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_vibration(
