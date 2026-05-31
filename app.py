@@ -142,7 +142,7 @@ st.markdown("---")
 # ── Session state ──────────────────────────────────────────────────────────────
 for k, v in [
     ("orig_tmp_path",    None),
-    ("orig_vid_bytes",   None),
+    ("orig_preview_path", None),
     ("magnified_path",   None),
     ("mag_vid_bytes",    None),
     ("mag_vid_w",        0),
@@ -233,15 +233,14 @@ def _get_video_info(input_path: str) -> dict:
     return info
 
 
-def to_browser_mp4_bytes(input_path: str) -> bytes:
-    stderr_tmp = None
-    out_path   = None
-
+def prepare_browser_preview(input_path: str, out_path: str) -> bool:
+    """
+    Re-encode input_path to a browser-compatible H.264 MP4 saved at out_path.
+    Caps preview at 480p to keep RAM/disk low on Streamlit Cloud.
+    Returns True on success. Never loads video into Python memory.
+    """
+    stderr_tmp = tempfile.mktemp(suffix=".txt")
     try:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            out_path = tmp.name
-        stderr_tmp = tempfile.mktemp(suffix=".txt")
-
         vid_info = _get_video_info(input_path)
         rotation = vid_info["rotate_tag"] or vid_info["display_matrix_rotation"]
 
@@ -254,110 +253,62 @@ def to_browser_mp4_bytes(input_path: str) -> bytes:
         else:
             rotate_filter = ""
 
-        vf_with_rotate = (
-            f"{rotate_filter}"
-            "scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2)"
-        )
-        vf_plain = "scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2)"
+        # Cap preview at 480p — saves RAM and /tmp space
+        # Simple: scale longest side to 854, force even dims
+        scale_480 = "scale=854:480:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        vf_plain        = scale_480
+        vf_with_rotate  = f"{rotate_filter}{scale_480}"
 
-        encode_flags = [
-            "-c:v", "libx264",
-            "-crf", "23",
-            "-preset", "fast",
-            "-pix_fmt", "yuv420p",
-        ]
+        encode_flags = ["-c:v", "libx264", "-crf", "26",
+                        "-preset", "fast", "-pix_fmt", "yuv420p"]
 
         def _run(cmd):
             with open(stderr_tmp, "wb") as ef:
-                return subprocess.run(
-                    cmd, stdout=subprocess.DEVNULL, stderr=ef, timeout=600,
-                )
+                return subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                      stderr=ef, timeout=300)
 
         def _ok(proc):
-            return (
-                proc.returncode == 0
-                and os.path.exists(out_path)
-                and os.path.getsize(out_path) > 0
-            )
+            return (proc.returncode == 0 and os.path.exists(out_path)
+                    and os.path.getsize(out_path) > 0)
 
-        r = _run([
-            "ffmpeg", "-y",
-            "-ignore_editlist", "1",
-            "-i", input_path,
-            *encode_flags,
-            "-vf", vf_plain,
-            "-movflags", "+faststart",
-            "-an",
-            out_path,
-        ])
+        r = _run(["ffmpeg", "-y", "-ignore_editlist", "1",
+                  "-i", input_path, *encode_flags,
+                  "-vf", vf_plain, "-movflags", "+faststart", "-an", out_path])
 
         if not _ok(r):
-            r = _run([
-                "ffmpeg", "-y",
-                "-ignore_editlist", "1",
-                "-noautorotate",
-                "-i", input_path,
-                *encode_flags,
-                "-vf", vf_with_rotate,
-                "-metadata:s:v:0", "rotate=0",
-                "-movflags", "+faststart",
-                "-an",
-                out_path,
-            ])
+            r = _run(["ffmpeg", "-y", "-ignore_editlist", "1",
+                      "-noautorotate", "-i", input_path, *encode_flags,
+                      "-vf", vf_with_rotate, "-metadata:s:v:0", "rotate=0",
+                      "-movflags", "+faststart", "-an", out_path])
 
         if not _ok(r):
-            r = _run([
-                "ffmpeg", "-y",
-                "-ignore_editlist", "1",
-                "-i", input_path,
-                *encode_flags,
-                "-vf", vf_plain,
-                "-movflags", "+faststart",
-                "-an",
-                out_path,
-            ])
-
-        if not _ok(r):
-            r = _run([
-                "ffmpeg", "-y",
-                "-ignore_editlist", "1",
-                "-i", input_path,
-                "-c:v", "copy",
-                "-movflags", "+faststart",
-                "-an",
-                out_path,
-            ])
+            r = _run(["ffmpeg", "-y", "-ignore_editlist", "1",
+                      "-i", input_path, "-c:v", "copy",
+                      "-movflags", "+faststart", "-an", out_path])
 
         if not _ok(r):
             with open(stderr_tmp, "r", errors="replace") as ef:
                 err_text = ef.read()[-2000:]
             st.error(
-                f"⚠️ ffmpeg could not prepare this video for preview "
-                f"(exit {r.returncode}). "
-                f"The file is still uploaded and **Run Motion Magnification** "
-                f"will still work.\n\n"
+                f"⚠️ ffmpeg could not prepare preview (exit {r.returncode}). "
+                f"**Run Motion Magnification** will still work.\n\n"
                 f"```\n{err_text}\n```\n\n"
-                f"**Detected codec:** `{vid_info['codec']}` · "
-                f"**Rotation:** `{rotation}°`"
+                f"**Codec:** `{vid_info['codec']}` · **Rotation:** `{rotation}°`"
             )
-            return b""
-
-        with open(out_path, "rb") as f:
-            return f.read()
+            return False
+        return True
 
     except FileNotFoundError:
-        st.error("ffmpeg not found. Add `ffmpeg` to packages.txt in your repo root.")
-        return b""
+        st.error("ffmpeg not found — add `ffmpeg` to packages.txt.")
+        return False
     except subprocess.TimeoutExpired:
-        st.error("ffmpeg timed out while preparing preview (>600s). Try a shorter clip.")
-        return b""
+        st.error("ffmpeg timed out preparing preview. Try a shorter clip.")
+        return False
     finally:
-        for p in (out_path, stderr_tmp):
-            if p:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+        try:
+            os.unlink(stderr_tmp)
+        except OSError:
+            pass
 
 
 def make_plot(result: dict) -> plt.Figure:
@@ -451,7 +402,7 @@ if uploaded_file:
                 st.session_state["orig_tmp_path"] = tmp.name
             del raw_bytes
             st.session_state["last_upload_name"] = fname
-            st.session_state["orig_vid_bytes"]   = None
+            st.session_state["orig_preview_path"] = None
             st.session_state["magnified_path"]   = None
             st.session_state["mag_vid_bytes"]    = None
             st.session_state["confirmed_roi"]    = None
@@ -463,14 +414,15 @@ if uploaded_file:
         is_hevc  = vid_info["codec"] in ("hevc", "h265", "h.265")
         rotation = vid_info["rotate_tag"] or vid_info["display_matrix_rotation"]
 
-        if st.session_state["orig_vid_bytes"] is None:
+        if st.session_state["orig_preview_path"] is None:
             codec_label = vid_info["codec"].upper() if vid_info["codec"] != "unknown" else "video"
             with st.spinner(
                 f"Preparing {codec_label} video for playback"
                 + (" (iPhone HEVC — this may take a moment)…" if is_hevc else "…")
             ):
-                b = to_browser_mp4_bytes(tmp_input_path)
-                st.session_state["orig_vid_bytes"] = b
+                preview_path = tmp_input_path + "_preview.mp4"
+                ok = prepare_browser_preview(tmp_input_path, preview_path)
+                st.session_state["orig_preview_path"] = preview_path if ok else None
 
         if vid_info["width"] > 0 and vid_info["height"] > 0:
             if rotation in (90, 270):
@@ -504,9 +456,10 @@ if uploaded_file:
             elif rotation:
                 st.info(f"🔄 Rotation detected: {rotation}° — baked into preview")
 
-            orig_bytes = st.session_state["orig_vid_bytes"]
-            if orig_bytes:
-                st.video(orig_bytes, format="video/mp4")
+            orig_preview = st.session_state["orig_preview_path"]
+            if orig_preview and os.path.exists(orig_preview):
+                with open(orig_preview, "rb") as _pf:
+                    st.video(_pf.read(), format="video/mp4")
             else:
                 st.warning(
                     "⚠️ Preview unavailable — ffmpeg could not re-encode this video. "
@@ -608,7 +561,7 @@ if uploaded_file:
         st.error(f"**Unhandled exception — please share this with the developer:**\n```\n{traceback.format_exc()}\n```")
 
 else:
-    for k in ["orig_tmp_path", "orig_vid_bytes", "magnified_path",
+    for k in ["orig_tmp_path", "orig_preview_path", "magnified_path",
               "mag_vid_bytes", "confirmed_roi", "pending_roi", "last_upload_name"]:
         st.session_state[k] = None
     st.info("Upload a video above, tune parameters in the sidebar, then click **Run Motion Magnification**.")
