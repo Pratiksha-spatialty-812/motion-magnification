@@ -16,24 +16,51 @@ from PIL import Image
 from magnify import process_video, analyze_vibration, ALPHA_CURVES
 
 # ── Static ffmpeg bootstrap ────────────────────────────────────────────────────
+_FFMPEG_DIR = "/tmp/ffmpeg_bin"
+
 def _ensure_ffmpeg():
-    """Download a static ffmpeg binary if the system one isn't available or is too heavy."""
-    if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0:
-        return  # already installed
+    """
+    Ensure ffmpeg/ffprobe are available.
+    - If already on PATH (system install), add nothing but verify.
+    - Otherwise download a static GPL build into /tmp/ffmpeg_bin and
+      prepend that dir to PATH so all subprocess calls find it.
+    """
+    # Check if a working ffmpeg is already on PATH
+    r = subprocess.run(["which", "ffmpeg"], capture_output=True)
+    if r.returncode == 0:
+        return  # system ffmpeg is fine
+
+    # Already downloaded in a previous Streamlit rerun?
+    if os.path.isfile(os.path.join(_FFMPEG_DIR, "ffmpeg")):
+        _prepend_path()
+        return
+
     ffmpeg_url = (
         "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/"
         "ffmpeg-master-latest-linux64-gpl.tar.xz"
     )
-    import urllib.request, tarfile
+    import urllib.request, tarfile as _tarfile
+    os.makedirs(_FFMPEG_DIR, exist_ok=True)
     local = "/tmp/ffmpeg.tar.xz"
     urllib.request.urlretrieve(ffmpeg_url, local)
-    with tarfile.open(local) as t:
+    with _tarfile.open(local) as t:
         for m in t.getmembers():
             if m.name.endswith("/ffmpeg") or m.name.endswith("/ffprobe"):
-                m.name = os.path.basename(m.name)
-                t.extract(m, "/usr/local/bin")
-    os.chmod("/usr/local/bin/ffmpeg", 0o755)
-    os.chmod("/usr/local/bin/ffprobe", 0o755)
+                m.name = os.path.basename(m.name)   # strip directory prefix
+                t.extract(m, _FFMPEG_DIR)
+    os.chmod(os.path.join(_FFMPEG_DIR, "ffmpeg"),  0o755)
+    os.chmod(os.path.join(_FFMPEG_DIR, "ffprobe"), 0o755)
+    try:
+        os.unlink(local)
+    except OSError:
+        pass
+    _prepend_path()
+
+def _prepend_path():
+    """Add our static binary dir to the front of PATH for this process."""
+    current = os.environ.get("PATH", "")
+    if _FFMPEG_DIR not in current:
+        os.environ["PATH"] = _FFMPEG_DIR + ":" + current
 
 _ensure_ffmpeg()
 
