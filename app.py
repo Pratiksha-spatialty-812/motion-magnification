@@ -197,16 +197,17 @@ def to_browser_mp4_bytes(input_path: str) -> bytes:
     Re-encode any video (including iPhone HEVC .mov) to a browser-compatible
     H.264 MP4 for st.video().
 
-    Strategy:
-    1. Probe the file with ffprobe to detect codec and rotation.
-    2. Build a -vf filter that:
-       a. Applies the correct transpose/flip to bake rotation into pixels.
-       b. Rounds dimensions to even numbers (libx264 requirement).
-    3. Clear the rotation metadata tag so browsers don't double-rotate.
-    4. If the first attempt fails (e.g. HEVC decoder missing), retry with
-       -c:v copy to remux without re-encoding, then fall back to a plain
-       scale-only transcode.
-    5. Never pass a 0-byte file to st.video().
+    Attempts in order:
+    1. autorotate ON (ffmpeg default) + libx264 — handles most videos including
+       iPhone when the system ffmpeg has the HEVC decoder built in.
+    2. Explicit -vf transpose to bake rotation, in case autorotate metadata
+       isn't being picked up.
+    3. Plain scale-only transcode (no transpose filter) — fallback for ffmpeg
+       builds that reject the transpose filter syntax.
+    4. Stream-copy remux — last resort, no transcode, gives something playable
+       if the source is already H.264.
+
+    Never passes a 0-byte file to st.video().
     """
     stderr_tmp = None
     out_path   = None
@@ -219,91 +220,109 @@ def to_browser_mp4_bytes(input_path: str) -> bytes:
         vid_info = _get_video_info(input_path)
         rotation = vid_info["rotate_tag"] or vid_info["display_matrix_rotation"]
 
-        # Build a vf chain that first fixes rotation, then rounds to even dims
-        # transpose=1  → 90° CW   (iPhone portrait recorded as landscape 90°)
-        # transpose=2  → 90° CCW  (270°)
-        # transpose=1,transpose=1 → 180°
+        # Rotation-aware vf filter — bakes rotation into pixels so all browsers
+        # display the video correctly regardless of metadata support.
         if rotation == 90:
-            rotate_filter = "transpose=1,"
+            rotate_filter = "transpose=1,"        # 90° CW
         elif rotation == 270:
-            rotate_filter = "transpose=2,"
+            rotate_filter = "transpose=2,"        # 90° CCW
         elif rotation == 180:
             rotate_filter = "transpose=1,transpose=1,"
         else:
             rotate_filter = ""
 
-        vf = (
+        vf_with_rotate = (
             f"{rotate_filter}"
             "scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2)"
         )
+        vf_plain = "scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2)"
 
-        def _run_ffmpeg(extra_input_flags=None, vcodec_flags=None, vf_override=None):
-            cmd = ["ffmpeg", "-y", "-ignore_editlist", "1"]
-            if extra_input_flags:
-                cmd += extra_input_flags
-            cmd += ["-i", input_path]
-            if vcodec_flags:
-                cmd += vcodec_flags
-            else:
-                cmd += [
-                    "-c:v", "libx264",
-                    "-crf", "23",
-                    "-preset", "fast",
-                    "-pix_fmt", "yuv420p",
-                ]
-            cmd += [
-                "-vf", vf_override if vf_override is not None else vf,
-                "-metadata:s:v:0", "rotate=0",
-                "-movflags", "+faststart",
-                "-an",
-                out_path,
-            ]
+        encode_flags = [
+            "-c:v", "libx264",
+            "-crf", "23",
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+        ]
+
+        def _run(cmd):
             with open(stderr_tmp, "wb") as ef:
                 return subprocess.run(
-                    cmd,
-                    stdout=subprocess.DEVNULL,
-                    stderr=ef,
-                    timeout=600,
+                    cmd, stdout=subprocess.DEVNULL, stderr=ef, timeout=600,
                 )
 
-        def _output_ok(proc):
+        def _ok(proc):
             return (
                 proc.returncode == 0
                 and os.path.exists(out_path)
                 and os.path.getsize(out_path) > 0
             )
 
-        # ── Attempt 1: standard H.264 transcode (works for most videos) ──────
-        r = _run_ffmpeg()
+        # ── Attempt 1: let ffmpeg autorotate + libx264 ────────────────────────
+        # ffmpeg reads the rotation tag automatically and applies it. Works for
+        # most iPhone MOV/HEVC when the system ffmpeg has the HEVC decoder.
+        r = _run([
+            "ffmpeg", "-y",
+            "-ignore_editlist", "1",
+            "-i", input_path,
+            *encode_flags,
+            "-vf", vf_plain,          # just even-round dims; autorotate does the rest
+            "-movflags", "+faststart",
+            "-an",
+            out_path,
+        ])
 
-        # ── Attempt 2: force software HEVC decode (iPhone H.265) ─────────────
-        if not _output_ok(r):
-            r = _run_ffmpeg(
-                extra_input_flags=["-c:v", "hevc"],
-            )
+        # ── Attempt 2: explicit transpose filter (disable autorotate) ─────────
+        # Some older ffmpeg builds don't autorotate from display-matrix side data.
+        if not _ok(r):
+            r = _run([
+                "ffmpeg", "-y",
+                "-ignore_editlist", "1",
+                "-noautorotate",       # we handle rotation manually via transpose
+                "-i", input_path,
+                *encode_flags,
+                "-vf", vf_with_rotate,
+                "-metadata:s:v:0", "rotate=0",
+                "-movflags", "+faststart",
+                "-an",
+                out_path,
+            ])
 
-        # ── Attempt 3: skip transpose, just scale (some ffmpeg builds lack it) ─
-        if not _output_ok(r):
-            r = _run_ffmpeg(
-                vf_override="scale=max(2\\,trunc(iw/2)*2):max(2\\,trunc(ih/2)*2)"
-            )
+        # ── Attempt 3: no rotation handling, bare transcode ───────────────────
+        # If transpose filter fails (unlikely with ffmpeg 7.x), skip it.
+        if not _ok(r):
+            r = _run([
+                "ffmpeg", "-y",
+                "-ignore_editlist", "1",
+                "-i", input_path,
+                *encode_flags,
+                "-vf", vf_plain,
+                "-movflags", "+faststart",
+                "-an",
+                out_path,
+            ])
 
-        # ── Attempt 4: stream-copy remux (no transcode at all) ───────────────
-        # Works if the source is already H.264; skips rotation fix but at least
-        # gives the user something to see.
-        if not _output_ok(r):
-            r = _run_ffmpeg(
-                vcodec_flags=["-c:v", "copy"],
-                vf_override=None,
-            )
+        # ── Attempt 4: stream-copy remux ──────────────────────────────────────
+        # No transcode at all. Works if source is already H.264; portrait may
+        # display sideways but at least something plays.
+        if not _ok(r):
+            r = _run([
+                "ffmpeg", "-y",
+                "-ignore_editlist", "1",
+                "-i", input_path,
+                "-c:v", "copy",
+                "-movflags", "+faststart",
+                "-an",
+                out_path,
+            ])
 
-        if not _output_ok(r):
+        if not _ok(r):
             with open(stderr_tmp, "r", errors="replace") as ef:
                 err_text = ef.read()[-2000:]
             st.error(
                 f"⚠️ ffmpeg could not prepare this video for preview "
                 f"(exit {r.returncode}). "
-                f"The file is still uploaded and can be processed below.\n\n"
+                f"The file is still uploaded and **Run Motion Magnification** "
+                f"will still work.\n\n"
                 f"```\n{err_text}\n```\n\n"
                 f"**Detected codec:** `{vid_info['codec']}` · "
                 f"**Rotation:** `{rotation}°`"
