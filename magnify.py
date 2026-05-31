@@ -145,7 +145,7 @@ class Magnify(object):
 
                 lambd /= 2.0
 
-            output_channels.append(reconPyr(filtered))   # one per channel (r, g, b)
+            output_channels.append(reconPyr(filtered))
 
         output = np.stack(output_channels, axis=2)
         output = img2 + output
@@ -164,17 +164,18 @@ def _even(n):
 
 def _detect_rotation(input_path: str) -> int:
     """
-    Read the video stream's rotation tag via ffprobe.
+    Read the video stream's rotation via ffprobe.
     Returns 0, 90, 180, or 270.
 
-    Strategy (most-to-least reliable):
-    1. Try the simple 'rotate' stream tag (older phones, many cameras).
-    2. Try the 'side_data' display matrix (newer iOS / Android).
-    Phones record portrait video with rotate=90 or 270; OpenCV ignores this.
+    Checks both:
+    1. Simple 'rotate' stream tag  (Android, older cameras, many MP4s).
+    2. 'side_data' display matrix  (iPhone iOS 14+, newer .mov files).
 
     Uses a temp file for stderr to avoid pipe-buffer issues on slow systems.
     """
-    # --- method 1: rotate tag ---
+    stderr_tmp = None
+
+    # ── Method 1: rotate tag ──────────────────────────────────────────────────
     try:
         stderr_tmp = tempfile.mktemp(suffix=".txt")
         with open(stderr_tmp, "wb") as ef:
@@ -196,15 +197,17 @@ def _detect_rotation(input_path: str) -> int:
     except Exception:
         pass
     finally:
-        try:
-            os.unlink(stderr_tmp)
-        except OSError:
-            pass
+        if stderr_tmp:
+            try:
+                os.unlink(stderr_tmp)
+            except OSError:
+                pass
+        stderr_tmp = None
 
-    # --- method 2: display matrix side data ---
+    # ── Method 2: display matrix (iPhone iOS 14+) ─────────────────────────────
     try:
-        stderr_tmp2 = tempfile.mktemp(suffix=".txt")
-        with open(stderr_tmp2, "wb") as ef:
+        stderr_tmp = tempfile.mktemp(suffix=".txt")
+        with open(stderr_tmp, "wb") as ef:
             probe2 = subprocess.run(
                 [
                     "ffprobe", "-v", "error",
@@ -219,17 +222,51 @@ def _detect_rotation(input_path: str) -> int:
             )
         val2 = probe2.stdout.decode(errors="replace").strip()
         if val2 and val2.lstrip("-").isdigit():
-            # display matrix stores negative rotation; normalise to 0/90/180/270
+            # Display matrix stores NEGATIVE rotation; normalise to 0/90/180/270
             return (-int(val2)) % 360
     except Exception:
         pass
     finally:
-        try:
-            os.unlink(stderr_tmp2)
-        except OSError:
-            pass
+        if stderr_tmp:
+            try:
+                os.unlink(stderr_tmp)
+            except OSError:
+                pass
 
     return 0
+
+
+def _detect_codec(input_path: str) -> str:
+    """
+    Return the video stream codec name (e.g. 'hevc', 'h264', 'mpeg4').
+    Returns 'unknown' on failure.
+    """
+    stderr_tmp = None
+    try:
+        stderr_tmp = tempfile.mktemp(suffix=".txt")
+        with open(stderr_tmp, "wb") as ef:
+            r = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    input_path,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=ef,
+                timeout=15,
+            )
+        codec = r.stdout.decode(errors="replace").strip().lower()
+        return codec if codec else "unknown"
+    except Exception:
+        return "unknown"
+    finally:
+        if stderr_tmp:
+            try:
+                os.unlink(stderr_tmp)
+            except OSError:
+                pass
 
 
 def _apply_rotation(frame: np.ndarray, rot: int) -> np.ndarray:
@@ -243,8 +280,67 @@ def _apply_rotation(frame: np.ndarray, rot: int) -> np.ndarray:
     return frame
 
 
+def _open_video_capture(input_path: str, codec: str) -> cv2.VideoCapture:
+    """
+    Open a VideoCapture, with a special pre-transcode path for HEVC/H.265
+    (iPhone) videos that OpenCV cannot decode natively.
+
+    For HEVC inputs we use ffmpeg to pipe raw BGR frames into a temporary
+    intermediate file that OpenCV CAN read (MJPEG or uncompressed AVI),
+    then return a VideoCapture on that temp file.
+
+    Returns (cap, temp_path_or_None).  Caller must release cap and, if
+    temp_path is not None, delete it when done.
+    """
+    # OpenCV usually cannot decode HEVC.  Transcode to a fast intermediate.
+    if codec in ("hevc", "h265", "h.265"):
+        tmp_path = tempfile.mktemp(suffix="_interim.avi")
+        stderr_tmp = tempfile.mktemp(suffix=".txt")
+        try:
+            with open(stderr_tmp, "wb") as ef:
+                r = subprocess.run(
+                    [
+                        "ffmpeg", "-y",
+                        "-ignore_editlist", "1",
+                        "-i", input_path,
+                        "-c:v", "mjpeg",       # MJPEG is fast and OpenCV reads it
+                        "-q:v", "3",           # near-lossless quality
+                        "-an",
+                        tmp_path,
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=ef,
+                    timeout=300,
+                )
+            if (
+                r.returncode == 0
+                and os.path.exists(tmp_path)
+                and os.path.getsize(tmp_path) > 0
+            ):
+                cap = cv2.VideoCapture(tmp_path)
+                if cap.isOpened():
+                    return cap, tmp_path
+                cap.release()
+        except Exception:
+            pass
+        finally:
+            try:
+                os.unlink(stderr_tmp)
+            except OSError:
+                pass
+        # If MJPEG transcode failed, fall through to direct open (may still work
+        # if the system ffmpeg is linked into OpenCV)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    cap = cv2.VideoCapture(input_path)
+    return cap, None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-#  Video processing — direct ffmpeg pipe, portrait-safe
+#  Video processing — direct ffmpeg pipe, portrait-safe, HEVC-safe
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_video(
@@ -261,142 +357,161 @@ def process_video(
     max_dimension=None,
 ):
     """
-    Process a video file with motion magnification.
+    Process a video file with Eulerian motion magnification.
 
-    Key design points:
-    - Frames piped directly to ffmpeg (libx264) — no huge intermediate raw file.
-    - EXIF/container rotation detected via ffprobe (both tag and display matrix)
-      and baked into pixel data; portrait videos stay portrait.
-    - _even() never returns 0 (minimum 2).
-    - First frame written to the pipe is the same prepared frame Magnify was
-      initialised with — prevents dimension mismatch on frame 1.
-    - ffmpeg stderr written to a temp file to avoid pipe-buffer deadlock on
-      long videos.
+    Key design points
+    -----------------
+    * HEVC / iPhone videos: detected via ffprobe; transcoded to a fast MJPEG
+      intermediate that OpenCV can decode before processing begins.
+    * EXIF / container rotation: detected via ffprobe (both simple tag AND
+      display-matrix side data) and baked into pixel data with _apply_rotation().
+      Portrait phone videos stay portrait.
+    * Frames piped directly to ffmpeg (libx264) — no huge intermediate raw file.
+    * _even() guarantees minimum dimension of 2 — never produces 0-width output.
+    * First frame written to the ffmpeg pipe is the same prepared frame Magnify
+      was initialised with — prevents any dimension mismatch on frame 1.
+    * ffmpeg stderr written to a temp file to avoid pipe-buffer deadlock on
+      long/HD videos.
+    * Temp intermediate file (for HEVC) is cleaned up in a finally block.
     """
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {input_path}")
-
-    raw_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    raw_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    # ── Detect rotation BEFORE computing target dimensions ───────────────────
+    # ── Detect codec and rotation BEFORE opening VideoCapture ────────────────
+    codec    = _detect_codec(input_path)
     rotation = _detect_rotation(input_path)
 
-    # After applying rotation, logical frame dimensions may be swapped
-    if rotation in (90, 270):
-        orig_w, orig_h = raw_h, raw_w   # portrait phone video
-    else:
-        orig_w, orig_h = raw_w, raw_h
+    # ── Open VideoCapture (with HEVC workaround if needed) ───────────────────
+    cap, interim_path = _open_video_capture(input_path, codec)
 
-    # ── Optional downscale (applied to post-rotation dimensions) ─────────────
-    if max_dimension and max(orig_w, orig_h) > max_dimension:
-        scale = max_dimension / max(orig_w, orig_h)
-        w = _even(orig_w * scale)
-        h = _even(orig_h * scale)
-    else:
-        w = _even(orig_w)
-        h = _even(orig_h)
+    if not cap.isOpened():
+        raise ValueError(
+            f"Cannot open video: {input_path} "
+            f"(codec={codec}, rotation={rotation}°)"
+        )
 
-    # ── Prepare every frame: rotate then resize to (w, h) ────────────────────
-    def _prepare(frame: np.ndarray) -> np.ndarray:
-        if rotation:
-            frame = _apply_rotation(frame, rotation)
-        fh_fr, fw_fr = frame.shape[:2]
-        if fw_fr != w or fh_fr != h:
-            frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
-        return frame
-
-    # ── ffmpeg stderr goes to a temp file — avoids pipe-buffer deadlock ───────
-    stderr_tmp = tempfile.mktemp(suffix=".txt")
-
-    # ── Spin up ffmpeg — raw BGR stdin → H.264 output ────────────────────────
-    ffmpeg_cmd = [
-        "ffmpeg", "-y",
-        "-f", "rawvideo",
-        "-vcodec", "rawvideo",
-        "-s", f"{w}x{h}",
-        "-pix_fmt", "bgr24",
-        "-r", str(fps),
-        "-i", "pipe:0",
-        "-vcodec", "libx264",
-        "-crf", "23",
-        "-preset", "fast",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        # Rotation has been baked in — clear any residual rotation tag so
-        # players don't double-rotate the output.
-        "-metadata:s:v:0", "rotate=0",
-        output_path,
-    ]
-
-    stderr_file = None
     try:
-        stderr_file = open(stderr_tmp, "wb")
-        try:
-            ffmpeg_proc = subprocess.Popen(
-                ffmpeg_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_file,
-            )
-        except FileNotFoundError:
-            cap.release()
-            raise RuntimeError(
-                "ffmpeg not found. Add `ffmpeg` to packages.txt in your repo root."
-            )
+        raw_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        raw_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        try:
-            ret, raw1 = cap.read()
-            if not ret:
-                raise ValueError("Failed to read first frame from video.")
+        # After applying rotation, logical frame dimensions may be swapped
+        if rotation in (90, 270):
+            orig_w, orig_h = raw_h, raw_w   # portrait phone video
+        else:
+            orig_w, orig_h = raw_w, raw_h
 
-            img1 = _prepare(raw1)   # rotate + resize
+        # ── Optional downscale (applied to post-rotation dimensions) ──────────
+        if max_dimension and max(orig_w, orig_h) > max_dimension:
+            scale = max_dimension / max(orig_w, orig_h)
+            w = _even(orig_w * scale)
+            h = _even(orig_h * scale)
+        else:
+            w = _even(orig_w)
+            h = _even(orig_h)
 
-            magnifier = Magnify(
-                img1,
-                alpha, lambda_c, fl, fh, fps,
-                n_levels=n_levels,
-                alpha_curve=alpha_curve,
-            )
-            ffmpeg_proc.stdin.write(img1.tobytes())   # pipe the prepared frame
+        # ── Prepare every frame: rotate then resize to (w, h) ─────────────────
+        def _prepare(frame: np.ndarray) -> np.ndarray:
+            if rotation:
+                frame = _apply_rotation(frame, rotation)
+            fh_fr, fw_fr = frame.shape[:2]
+            if fw_fr != w or fh_fr != h:
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
+            return frame
 
-            frame_count = 1
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                prepared  = _prepare(frame)
-                processed = magnifier.process_frame(prepared)
-                ffmpeg_proc.stdin.write(processed.tobytes())
-                frame_count += 1
-                if progress_callback:
-                    progress_callback(frame_count, total_frames)
-
-        finally:
-            cap.release()
-            try:
-                ffmpeg_proc.stdin.close()
-            except BrokenPipeError:
-                pass
-
-        ffmpeg_proc.wait()
-        stderr_file.close()
+        # ── ffmpeg stderr goes to a temp file — avoids pipe-buffer deadlock ───
+        stderr_tmp  = tempfile.mktemp(suffix=".txt")
         stderr_file = None
 
-        if ffmpeg_proc.returncode != 0:
-            with open(stderr_tmp, "r", errors="replace") as ef:
-                err_text = ef.read()[-3000:]
-            raise RuntimeError(f"ffmpeg encoding failed:\n{err_text}")
+        # ── Spin up ffmpeg — raw BGR stdin → H.264 output ─────────────────────
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}",
+            "-pix_fmt", "bgr24",
+            "-r", str(fps),
+            "-i", "pipe:0",
+            "-vcodec", "libx264",
+            "-crf", "23",
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            # Rotation has been baked in — clear residual tag so players
+            # don't double-rotate the output.
+            "-metadata:s:v:0", "rotate=0",
+            output_path,
+        ]
+
+        try:
+            stderr_file = open(stderr_tmp, "wb")
+            try:
+                ffmpeg_proc = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                )
+            except FileNotFoundError:
+                raise RuntimeError(
+                    "ffmpeg not found. Add `ffmpeg` to packages.txt in your repo root."
+                )
+
+            try:
+                ret, raw1 = cap.read()
+                if not ret:
+                    raise ValueError("Failed to read first frame from video.")
+
+                img1 = _prepare(raw1)   # rotate + resize
+
+                magnifier = Magnify(
+                    img1,
+                    alpha, lambda_c, fl, fh, fps,
+                    n_levels=n_levels,
+                    alpha_curve=alpha_curve,
+                )
+                ffmpeg_proc.stdin.write(img1.tobytes())   # pipe the prepared frame
+
+                frame_count = 1
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    prepared  = _prepare(frame)
+                    processed = magnifier.process_frame(prepared)
+                    ffmpeg_proc.stdin.write(processed.tobytes())
+                    frame_count += 1
+                    if progress_callback:
+                        progress_callback(frame_count, total_frames)
+
+            finally:
+                try:
+                    ffmpeg_proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+
+            ffmpeg_proc.wait()
+            stderr_file.close()
+            stderr_file = None
+
+            if ffmpeg_proc.returncode != 0:
+                with open(stderr_tmp, "r", errors="replace") as ef:
+                    err_text = ef.read()[-3000:]
+                raise RuntimeError(f"ffmpeg encoding failed:\n{err_text}")
+
+        finally:
+            if stderr_file and not stderr_file.closed:
+                stderr_file.close()
+            try:
+                os.unlink(stderr_tmp)
+            except OSError:
+                pass
 
     finally:
-        if stderr_file and not stderr_file.closed:
-            stderr_file.close()
-        try:
-            os.unlink(stderr_tmp)
-        except OSError:
-            pass
+        cap.release()
+        # Clean up the HEVC interim transcode temp file if one was created
+        if interim_path:
+            try:
+                os.unlink(interim_path)
+            except OSError:
+                pass
 
     return output_path
 
@@ -412,6 +527,13 @@ def analyze_vibration(
     method: str = "farneback",
     progress_callback=None,
 ) -> dict:
+    """
+    Compute an optical-flow-based motion signal inside an ROI on the
+    magnified video, then FFT it to find dominant vibration frequency.
+
+    The magnified output is always H.264 MP4 (written by process_video),
+    so no special HEVC handling is needed here — VideoCapture opens it fine.
+    """
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         raise ValueError(f"Cannot open video: {input_path}")
@@ -471,7 +593,7 @@ def analyze_vibration(
                 good_old = p0[st == 1] if p1 is not None else np.array([])
                 if len(good_new) > 0:
                     diff = good_new - good_old
-                    mag = np.sqrt((diff ** 2).sum(axis=1))
+                    mag  = np.sqrt((diff ** 2).sum(axis=1))
                     motion_signal.append(float(mag.mean()))
                 else:
                     motion_signal.append(0.0)
@@ -485,19 +607,19 @@ def analyze_vibration(
     cap.release()
 
     motion = np.array(motion_signal, dtype=float)
-    N = len(motion)
-    times = np.arange(N) / fps
+    N      = len(motion)
+    times  = np.arange(N) / fps
     motion_ac = motion - motion.mean()
-    window = np.hanning(N)
-    fft_vals = np.fft.rfft(motion_ac * window)
-    freqs = np.fft.rfftfreq(N, d=1.0 / fps)
-    power = (np.abs(fft_vals) ** 2) / N
+    window    = np.hanning(N)
+    fft_vals  = np.fft.rfft(motion_ac * window)
+    freqs     = np.fft.rfftfreq(N, d=1.0 / fps)
+    power     = (np.abs(fft_vals) ** 2) / N
 
     if len(freqs) > 1:
         freqs = freqs[1:]
         power = power[1:]
 
-    dom_idx = int(np.argmax(power))
+    dom_idx      = int(np.argmax(power))
     dominant_hz  = float(freqs[dom_idx])
     dominant_amp = float(np.sqrt(power[dom_idx]))
 
