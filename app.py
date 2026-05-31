@@ -7,12 +7,35 @@ import io
 import time
 import base64
 import subprocess
+import traceback
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from PIL import Image
 from magnify import process_video, analyze_vibration, ALPHA_CURVES
+
+# ── Static ffmpeg bootstrap ────────────────────────────────────────────────────
+def _ensure_ffmpeg():
+    """Download a static ffmpeg binary if the system one isn't available or is too heavy."""
+    if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0:
+        return  # already installed
+    ffmpeg_url = (
+        "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/"
+        "ffmpeg-master-latest-linux64-gpl.tar.xz"
+    )
+    import urllib.request, tarfile
+    local = "/tmp/ffmpeg.tar.xz"
+    urllib.request.urlretrieve(ffmpeg_url, local)
+    with tarfile.open(local) as t:
+        for m in t.getmembers():
+            if m.name.endswith("/ffmpeg") or m.name.endswith("/ffprobe"):
+                m.name = os.path.basename(m.name)
+                t.extract(m, "/usr/local/bin")
+    os.chmod("/usr/local/bin/ffmpeg", 0o755)
+    os.chmod("/usr/local/bin/ffprobe", 0o755)
+
+_ensure_ffmpeg()
 
 st.set_page_config(
     page_title="Motion Magnification Lab",
@@ -109,10 +132,6 @@ for k, v in [
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _check_ffmpeg_capabilities():
-    """
-    Return a dict of what this ffmpeg build supports.
-    Used to choose the best transcode strategy for iPhone (HEVC/H.265) videos.
-    """
     caps = {"hevc": False, "h264": False, "libx264": False}
     try:
         r = subprocess.run(
@@ -132,10 +151,6 @@ def _check_ffmpeg_capabilities():
 
 
 def _get_video_info(input_path: str) -> dict:
-    """
-    Use ffprobe to get codec, rotation tag, display-matrix rotation,
-    and basic stream info. Returns a dict with safe defaults on failure.
-    """
     info = {
         "codec": "unknown",
         "rotate_tag": 0,
@@ -181,7 +196,6 @@ def _get_video_info(input_path: str) -> dict:
             elif k == "TAG:rotate" and v.lstrip("-").isdigit():
                 info["rotate_tag"] = int(v) % 360
             elif k == "rotation" and v.lstrip("-").isdigit():
-                # display matrix stores NEGATIVE rotation; normalise
                 info["display_matrix_rotation"] = (-int(v)) % 360
         try:
             os.unlink(stderr_tmp)
@@ -193,22 +207,6 @@ def _get_video_info(input_path: str) -> dict:
 
 
 def to_browser_mp4_bytes(input_path: str) -> bytes:
-    """
-    Re-encode any video (including iPhone HEVC .mov) to a browser-compatible
-    H.264 MP4 for st.video().
-
-    Attempts in order:
-    1. autorotate ON (ffmpeg default) + libx264 — handles most videos including
-       iPhone when the system ffmpeg has the HEVC decoder built in.
-    2. Explicit -vf transpose to bake rotation, in case autorotate metadata
-       isn't being picked up.
-    3. Plain scale-only transcode (no transpose filter) — fallback for ffmpeg
-       builds that reject the transpose filter syntax.
-    4. Stream-copy remux — last resort, no transcode, gives something playable
-       if the source is already H.264.
-
-    Never passes a 0-byte file to st.video().
-    """
     stderr_tmp = None
     out_path   = None
 
@@ -220,12 +218,10 @@ def to_browser_mp4_bytes(input_path: str) -> bytes:
         vid_info = _get_video_info(input_path)
         rotation = vid_info["rotate_tag"] or vid_info["display_matrix_rotation"]
 
-        # Rotation-aware vf filter — bakes rotation into pixels so all browsers
-        # display the video correctly regardless of metadata support.
         if rotation == 90:
-            rotate_filter = "transpose=1,"        # 90° CW
+            rotate_filter = "transpose=1,"
         elif rotation == 270:
-            rotate_filter = "transpose=2,"        # 90° CCW
+            rotate_filter = "transpose=2,"
         elif rotation == 180:
             rotate_filter = "transpose=1,transpose=1,"
         else:
@@ -257,27 +253,22 @@ def to_browser_mp4_bytes(input_path: str) -> bytes:
                 and os.path.getsize(out_path) > 0
             )
 
-        # ── Attempt 1: let ffmpeg autorotate + libx264 ────────────────────────
-        # ffmpeg reads the rotation tag automatically and applies it. Works for
-        # most iPhone MOV/HEVC when the system ffmpeg has the HEVC decoder.
         r = _run([
             "ffmpeg", "-y",
             "-ignore_editlist", "1",
             "-i", input_path,
             *encode_flags,
-            "-vf", vf_plain,          # just even-round dims; autorotate does the rest
+            "-vf", vf_plain,
             "-movflags", "+faststart",
             "-an",
             out_path,
         ])
 
-        # ── Attempt 2: explicit transpose filter (disable autorotate) ─────────
-        # Some older ffmpeg builds don't autorotate from display-matrix side data.
         if not _ok(r):
             r = _run([
                 "ffmpeg", "-y",
                 "-ignore_editlist", "1",
-                "-noautorotate",       # we handle rotation manually via transpose
+                "-noautorotate",
                 "-i", input_path,
                 *encode_flags,
                 "-vf", vf_with_rotate,
@@ -287,8 +278,6 @@ def to_browser_mp4_bytes(input_path: str) -> bytes:
                 out_path,
             ])
 
-        # ── Attempt 3: no rotation handling, bare transcode ───────────────────
-        # If transpose filter fails (unlikely with ffmpeg 7.x), skip it.
         if not _ok(r):
             r = _run([
                 "ffmpeg", "-y",
@@ -301,9 +290,6 @@ def to_browser_mp4_bytes(input_path: str) -> bytes:
                 out_path,
             ])
 
-        # ── Attempt 4: stream-copy remux ──────────────────────────────────────
-        # No transcode at all. Works if source is already H.264; portrait may
-        # display sideways but at least something plays.
         if not _ok(r):
             r = _run([
                 "ffmpeg", "-y",
@@ -416,7 +402,6 @@ with st.sidebar:
 st.markdown('<div class="step-badge">STEP 1 — Upload &amp; Magnify</div>', unsafe_allow_html=True)
 st.markdown("### 📤 Upload Video")
 
-# Accept HEVC/MOV from iPhones explicitly
 uploaded_file = st.file_uploader(
     "Drop your video here (MP4, MOV, AVI, MKV — including iPhone HEVC)",
     type=["mp4", "avi", "mov", "mkv", "hevc", "m4v"],
@@ -427,175 +412,173 @@ vid_w = vid_h = total_frames = 0
 vid_fps = 0.0
 
 if uploaded_file:
-    fname = uploaded_file.name
-    file_size_mb = uploaded_file.size / (1024 * 1024)
+    try:
+        fname = uploaded_file.name
+        file_size_mb = uploaded_file.size / (1024 * 1024)
 
-    if st.session_state["last_upload_name"] != fname:
-        raw_bytes = uploaded_file.read()
-        suffix = os.path.splitext(fname)[1].lower() or ".mp4"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(raw_bytes)
-            st.session_state["orig_tmp_path"] = tmp.name
-        del raw_bytes
-        st.session_state["last_upload_name"] = fname
-        # Reset ALL derived state for the new file
-        st.session_state["orig_vid_bytes"]   = None
-        st.session_state["magnified_path"]   = None
-        st.session_state["mag_vid_bytes"]    = None
-        st.session_state["confirmed_roi"]    = None
-        st.session_state["pending_roi"]      = None
+        if st.session_state["last_upload_name"] != fname:
+            raw_bytes = uploaded_file.read()
+            suffix = os.path.splitext(fname)[1].lower() or ".mp4"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(raw_bytes)
+                st.session_state["orig_tmp_path"] = tmp.name
+            del raw_bytes
+            st.session_state["last_upload_name"] = fname
+            st.session_state["orig_vid_bytes"]   = None
+            st.session_state["magnified_path"]   = None
+            st.session_state["mag_vid_bytes"]    = None
+            st.session_state["confirmed_roi"]    = None
+            st.session_state["pending_roi"]      = None
 
-    tmp_input_path = st.session_state["orig_tmp_path"]
+        tmp_input_path = st.session_state["orig_tmp_path"]
 
-    # Probe the uploaded file so we can show codec info to the user
-    vid_info = _get_video_info(tmp_input_path)
-    is_hevc  = vid_info["codec"] in ("hevc", "h265", "h.265")
-    rotation = vid_info["rotate_tag"] or vid_info["display_matrix_rotation"]
+        vid_info = _get_video_info(tmp_input_path)
+        is_hevc  = vid_info["codec"] in ("hevc", "h265", "h.265")
+        rotation = vid_info["rotate_tag"] or vid_info["display_matrix_rotation"]
 
-    # Prepare original video for browser playback (only once per upload)
-    if st.session_state["orig_vid_bytes"] is None:
-        codec_label = vid_info["codec"].upper() if vid_info["codec"] != "unknown" else "video"
-        with st.spinner(
-            f"Preparing {codec_label} video for playback"
-            + (" (iPhone HEVC — this may take a moment)…" if is_hevc else "…")
-        ):
-            b = to_browser_mp4_bytes(tmp_input_path)
-            st.session_state["orig_vid_bytes"] = b
+        if st.session_state["orig_vid_bytes"] is None:
+            codec_label = vid_info["codec"].upper() if vid_info["codec"] != "unknown" else "video"
+            with st.spinner(
+                f"Preparing {codec_label} video for playback"
+                + (" (iPhone HEVC — this may take a moment)…" if is_hevc else "…")
+            ):
+                b = to_browser_mp4_bytes(tmp_input_path)
+                st.session_state["orig_vid_bytes"] = b
 
-    # Use ffprobe dimensions when available (more reliable than OpenCV for HEVC/MOV)
-    if vid_info["width"] > 0 and vid_info["height"] > 0:
-        # Swap if rotation bakes portrait orientation
-        if rotation in (90, 270):
-            vid_w, vid_h = vid_info["height"], vid_info["width"]
-        else:
-            vid_w, vid_h = vid_info["width"], vid_info["height"]
-        total_frames = 0  # ffprobe doesn't give frame count easily; use cap below
-        vid_fps = 0.0
+        if vid_info["width"] > 0 and vid_info["height"] > 0:
+            if rotation in (90, 270):
+                vid_w, vid_h = vid_info["height"], vid_info["width"]
+            else:
+                vid_w, vid_h = vid_info["width"], vid_info["height"]
+            total_frames = 0
+            vid_fps = 0.0
 
-    cap = cv2.VideoCapture(tmp_input_path)
-    if cap.isOpened():
-        if total_frames == 0:
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if vid_fps == 0.0:
-            vid_fps = cap.get(cv2.CAP_PROP_FPS)
-        if vid_w == 0:
-            vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        if vid_h == 0:
-            vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        cap.release()
+        cap = cv2.VideoCapture(tmp_input_path)
+        if cap.isOpened():
+            if total_frames == 0:
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if vid_fps == 0.0:
+                vid_fps = cap.get(cv2.CAP_PROP_FPS)
+            if vid_w == 0:
+                vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            if vid_h == 0:
+                vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
 
-    duration = total_frames / vid_fps if vid_fps > 0 else vid_info["duration"]
+        duration = total_frames / vid_fps if vid_fps > 0 else vid_info["duration"]
 
-    left_up, right_up = st.columns([1, 1], gap="large")
+        left_up, right_up = st.columns([1, 1], gap="large")
 
-    with left_up:
-        st.markdown("**Original**")
+        with left_up:
+            st.markdown("**Original**")
 
-        # Show codec badge for iPhone videos
-        if is_hevc:
-            st.info("📱 iPhone HEVC (H.265) detected — transcoding to H.264 for preview")
-        elif rotation:
-            st.info(f"🔄 Rotation detected: {rotation}° — baked into preview")
+            if is_hevc:
+                st.info("📱 iPhone HEVC (H.265) detected — transcoding to H.264 for preview")
+            elif rotation:
+                st.info(f"🔄 Rotation detected: {rotation}° — baked into preview")
 
-        orig_bytes = st.session_state["orig_vid_bytes"]
-        if orig_bytes:
-            st.video(orig_bytes, format="video/mp4")
-        else:
-            st.warning(
-                "⚠️ Preview unavailable — ffmpeg could not re-encode this video. "
-                "The file is still uploaded and can be processed below."
-            )
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Resolution", f"{vid_w}×{vid_h}")
-        m2.metric("FPS", f"{vid_fps:.0f}" if vid_fps else "—")
-        m3.metric("Duration", f"{duration:.1f}s" if duration else "—")
-        m4.metric("Size", f"{file_size_mb:.1f} MB")
-
-    with right_up:
-        st.markdown("**Magnified output**")
-
-        if max_dimension and max(vid_w, vid_h) > max_dimension:
-            scale  = max_dimension / max(vid_w, vid_h)
-            proc_w = int(vid_w * scale) & ~1
-            proc_h = int(vid_h * scale) & ~1
-            st.caption(f"ℹ️ Will process at {proc_w}×{proc_h} (capped to {max_dimension}p)")
-        elif vid_w and vid_h:
-            st.caption(f"ℹ️ Will process at full {vid_w}×{vid_h}")
-
-        run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
-
-        if run_btn:
-            st.session_state["magnified_path"] = None
-            st.session_state["mag_vid_bytes"]  = None
-            st.session_state["confirmed_roi"]  = None
-            st.session_state["pending_roi"]    = None
-
-            out_path = tmp_input_path.replace(
-                os.path.splitext(tmp_input_path)[1], "_magnified.mp4"
-            )
-
-            status   = st.empty()
-            prog     = st.progress(0)
-            eta_slot = st.empty()
-            t0 = time.time()
-
-            def _cb(cur, tot):
-                prog.progress(min(cur / tot, 1.0))
-                el = time.time() - t0
-                if cur > 1:
-                    eta_slot.caption(
-                        f"Frame {cur}/{tot} · ETA {(el/(cur/tot))*(1-cur/tot):.0f}s"
-                    )
-
-            try:
-                status.info("🔄 Processing frames… (piping directly to H.264)")
-                final_path = process_video(
-                    input_path=tmp_input_path,
-                    output_path=out_path,
-                    alpha=alpha,
-                    lambda_c=lambda_c,
-                    fl=fl,
-                    fh=fh,
-                    fps=fps_sidebar,
-                    progress_callback=_cb,
-                    n_levels=n_levels,
-                    alpha_curve=alpha_curve,
-                    max_dimension=max_dimension,
+            orig_bytes = st.session_state["orig_vid_bytes"]
+            if orig_bytes:
+                st.video(orig_bytes, format="video/mp4")
+            else:
+                st.warning(
+                    "⚠️ Preview unavailable — ffmpeg could not re-encode this video. "
+                    "The file is still uploaded and can be processed below."
                 )
-                prog.progress(1.0)
-                eta_slot.empty()
 
-                status.info("📦 Reading output…")
-                with open(final_path, "rb") as f:
-                    mag_bytes = f.read()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Resolution", f"{vid_w}×{vid_h}")
+            m2.metric("FPS", f"{vid_fps:.0f}" if vid_fps else "—")
+            m3.metric("Duration", f"{duration:.1f}s" if duration else "—")
+            m4.metric("Size", f"{file_size_mb:.1f} MB")
 
-                cap_out = cv2.VideoCapture(final_path)
-                out_w   = int(cap_out.get(cv2.CAP_PROP_FRAME_WIDTH))
-                out_h   = int(cap_out.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                out_fps = cap_out.get(cv2.CAP_PROP_FPS)
-                cap_out.release()
+        with right_up:
+            st.markdown("**Magnified output**")
 
-                st.session_state["mag_vid_bytes"]  = mag_bytes
-                st.session_state["magnified_path"] = final_path
-                st.session_state["mag_vid_w"]      = out_w
-                st.session_state["mag_vid_h"]      = out_h
-                st.session_state["mag_vid_fps"]    = out_fps if out_fps > 0 else float(fps_sidebar)
-                status.success(f"✅ Done in {time.time()-t0:.1f}s — output: {out_w}×{out_h}")
+            if max_dimension and max(vid_w, vid_h) > max_dimension:
+                scale  = max_dimension / max(vid_w, vid_h)
+                proc_w = int(vid_w * scale) & ~1
+                proc_h = int(vid_h * scale) & ~1
+                st.caption(f"ℹ️ Will process at {proc_w}×{proc_h} (capped to {max_dimension}p)")
+            elif vid_w and vid_h:
+                st.caption(f"ℹ️ Will process at full {vid_w}×{vid_h}")
 
-            except Exception as e:
-                status.error(f"❌ {e}")
-                prog.empty()
-                eta_slot.empty()
+            run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
 
-        mag_bytes = st.session_state.get("mag_vid_bytes")
-        if mag_bytes:
-            st.video(mag_bytes, format="video/mp4")
-            st.download_button(
-                "⬇️ Download Magnified Video", data=mag_bytes,
-                file_name="magnified_output.mp4", mime="video/mp4",
-                use_container_width=True,
-            )
+            if run_btn:
+                st.session_state["magnified_path"] = None
+                st.session_state["mag_vid_bytes"]  = None
+                st.session_state["confirmed_roi"]  = None
+                st.session_state["pending_roi"]    = None
+
+                out_path = tmp_input_path.replace(
+                    os.path.splitext(tmp_input_path)[1], "_magnified.mp4"
+                )
+
+                status   = st.empty()
+                prog     = st.progress(0)
+                eta_slot = st.empty()
+                t0 = time.time()
+
+                def _cb(cur, tot):
+                    prog.progress(min(cur / tot, 1.0))
+                    el = time.time() - t0
+                    if cur > 1:
+                        eta_slot.caption(
+                            f"Frame {cur}/{tot} · ETA {(el/(cur/tot))*(1-cur/tot):.0f}s"
+                        )
+
+                try:
+                    status.info("🔄 Processing frames… (piping directly to H.264)")
+                    final_path = process_video(
+                        input_path=tmp_input_path,
+                        output_path=out_path,
+                        alpha=alpha,
+                        lambda_c=lambda_c,
+                        fl=fl,
+                        fh=fh,
+                        fps=fps_sidebar,
+                        progress_callback=_cb,
+                        n_levels=n_levels,
+                        alpha_curve=alpha_curve,
+                        max_dimension=max_dimension,
+                    )
+                    prog.progress(1.0)
+                    eta_slot.empty()
+
+                    status.info("📦 Reading output…")
+                    with open(final_path, "rb") as f:
+                        mag_bytes = f.read()
+
+                    cap_out = cv2.VideoCapture(final_path)
+                    out_w   = int(cap_out.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    out_h   = int(cap_out.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    out_fps = cap_out.get(cv2.CAP_PROP_FPS)
+                    cap_out.release()
+
+                    st.session_state["mag_vid_bytes"]  = mag_bytes
+                    st.session_state["magnified_path"] = final_path
+                    st.session_state["mag_vid_w"]      = out_w
+                    st.session_state["mag_vid_h"]      = out_h
+                    st.session_state["mag_vid_fps"]    = out_fps if out_fps > 0 else float(fps_sidebar)
+                    status.success(f"✅ Done in {time.time()-t0:.1f}s — output: {out_w}×{out_h}")
+
+                except Exception as e:
+                    status.error(f"❌ {e}")
+                    prog.empty()
+                    eta_slot.empty()
+
+            mag_bytes = st.session_state.get("mag_vid_bytes")
+            if mag_bytes:
+                st.video(mag_bytes, format="video/mp4")
+                st.download_button(
+                    "⬇️ Download Magnified Video", data=mag_bytes,
+                    file_name="magnified_output.mp4", mime="video/mp4",
+                    use_container_width=True,
+                )
+
+    except Exception as _top_err:
+        st.error(f"**Unhandled exception — please share this with the developer:**\n```\n{traceback.format_exc()}\n```")
 
 else:
     for k in ["orig_tmp_path", "orig_vid_bytes", "magnified_path",
