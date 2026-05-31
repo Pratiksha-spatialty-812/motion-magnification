@@ -255,7 +255,7 @@ def prepare_browser_preview(input_path: str, out_path: str) -> bool:
 
         # Cap preview at 480p — saves RAM and /tmp space
         # Simple: scale longest side to 854, force even dims
-        scale_480 = "scale=854:480:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
+        scale_480 = "scale=640:360:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
         vf_plain        = scale_480
         vf_with_rotate  = f"{rotate_filter}{scale_480}"
 
@@ -362,8 +362,8 @@ with st.sidebar:
         '<div class="param-label">Max dimension (px) — reduces RAM & /tmp usage</div>',
         unsafe_allow_html=True,
     )
-    res_options = {"No cap": None, "720p": 720, "480p": 480, "360p": 360}
-    res_label = st.selectbox("Max Dimension", list(res_options.keys()), index=1,
+    res_options = {"No cap (full resolution)": None, "1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
+    res_label = st.selectbox("Max Dimension", list(res_options.keys()), index=0,
                              label_visibility="collapsed")
     max_dimension = res_options[res_label]
 
