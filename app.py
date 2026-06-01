@@ -485,7 +485,6 @@ if uploaded_file:
 
             run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
 
-
             if run_btn:
                 st.session_state["magnified_path"] = None
                 st.session_state["mag_vid_bytes"]  = None
@@ -496,57 +495,10 @@ if uploaded_file:
                     os.path.splitext(tmp_input_path)[1], "_magnified.mp4"
                 )
 
-                # ── Rotation fix: re-fetch to be safe ──
-                _fresh_info = _get_video_info(tmp_input_path)
-                _rot_tag    = _fresh_info["rotate_tag"]
-                _rot_matrix = _fresh_info["display_matrix_rotation"]
-                rotation    = _rot_tag or _rot_matrix
-
-                if rotation in (90, 180, 270):
-                    rotated_input = tmp_input_path.replace(
-                        os.path.splitext(tmp_input_path)[1], "_rotfix.mp4"
-                    )
-                    if rotation == 90:
-                        vf = "transpose=1"
-                    elif rotation == 270:
-                        vf = "transpose=2"
-                    elif rotation == 180:
-                        vf = "transpose=1,transpose=1"
-
-                    with st.spinner(f"🔄 Normalising rotation ({rotation}°)…"):
-                        _rot_stderr = tempfile.mktemp(suffix=".txt")
-                        with open(_rot_stderr, "wb") as _ef:
-                            _rot_result = subprocess.run([
-                                "ffmpeg", "-y",
-                                "-noautorotate",
-                                "-i", tmp_input_path,
-                                "-vf", f"{vf},format=yuv420p",
-                                "-metadata:s:v:0", "rotate=0",
-                                "-c:v", "libx264", "-crf", "18",
-                                "-preset", "fast",
-                                "-pix_fmt", "yuv420p",
-                                "-map", "0:v:0",
-                                "-an",
-                                rotated_input
-                            ], stdout=subprocess.DEVNULL, stderr=_ef)
-                        if _rot_result.returncode != 0 or not os.path.exists(rotated_input) or os.path.getsize(rotated_input) == 0:
-                            with open(_rot_stderr, "r", errors="replace") as _ef:
-                                _rot_err_text = _ef.read()[-2000:]
-                            st.error(f"❌ Rotation fix failed (exit {_rot_result.returncode}):\n```\n{_rot_err_text}\n```")
-                            st.stop()
-
-                        try:
-                            os.unlink(_rot_stderr)
-                        except OSError:
-                            pass
-
-                    processing_input = rotated_input
-                    st.success(f"✅ Rotation normalised → {rotated_input}")
-                else:
-                    processing_input = tmp_input_path
-                with st.expander("🔍 Debug rotation info", expanded=False):
-                    st.write(f"rotate_tag: {_rot_tag}, display_matrix: {_rot_matrix}, final rotation: {rotation}")
-                    st.write(f"processing_input: {processing_input}")
+                status   = st.empty()
+                prog     = st.progress(0)
+                eta_slot = st.empty()
+                t0 = time.time()
                 # ────────────────────────────────────────────────────────────────────────────
 
                 status   = st.empty()
