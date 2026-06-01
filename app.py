@@ -486,8 +486,6 @@ if uploaded_file:
             run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
 
 
-
-
             if run_btn:
                 st.session_state["magnified_path"] = None
                 st.session_state["mag_vid_bytes"]  = None
@@ -498,8 +496,12 @@ if uploaded_file:
                     os.path.splitext(tmp_input_path)[1], "_magnified.mp4"
                 )
 
-                # ── Rotation fix: bake rotation into temp file so OpenCV sees correct orientation ──
-                rotation = vid_info["rotate_tag"] or vid_info["display_matrix_rotation"]
+                # ── Rotation fix: re-fetch to be safe ──
+                _fresh_info = _get_video_info(tmp_input_path)
+                _rot_tag    = _fresh_info["rotate_tag"]
+                _rot_matrix = _fresh_info["display_matrix_rotation"]
+                rotation    = _rot_tag or _rot_matrix
+
                 if rotation in (90, 180, 270):
                     rotated_input = tmp_input_path.replace(
                         os.path.splitext(tmp_input_path)[1], "_rotfix.mp4"
@@ -510,17 +512,19 @@ if uploaded_file:
                         vf = "transpose=2"
                     elif rotation == 180:
                         vf = "transpose=1,transpose=1"
-                    subprocess.run([
-                        "ffmpeg", "-y", "-i", tmp_input_path,
-                        "-vf", vf,
-                        "-metadata:s:v:0", "rotate=0",
-                        "-c:v", "libx264", "-crf", "18",
-                        "-preset", "fast", "-pix_fmt", "yuv420p",
-                        rotated_input
-                    ], check=True)
+                    with st.spinner(f"🔄 Normalising rotation ({rotation}°)…"):
+                        subprocess.run([
+                            "ffmpeg", "-y", "-i", tmp_input_path,
+                            "-vf", vf,
+                            "-metadata:s:v:0", "rotate=0",
+                            "-c:v", "libx264", "-crf", "18",
+                            "-preset", "fast", "-pix_fmt", "yuv420p",
+                            rotated_input
+                        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     processing_input = rotated_input
                 else:
                     processing_input = tmp_input_path
+    
                 # ────────────────────────────────────────────────────────────────────────────
 
                 status   = st.empty()
