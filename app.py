@@ -485,6 +485,9 @@ if uploaded_file:
 
             run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
 
+
+
+
             if run_btn:
                 st.session_state["magnified_path"] = None
                 st.session_state["mag_vid_bytes"]  = None
@@ -494,6 +497,31 @@ if uploaded_file:
                 out_path = tmp_input_path.replace(
                     os.path.splitext(tmp_input_path)[1], "_magnified.mp4"
                 )
+
+                # ── Rotation fix: bake rotation into temp file so OpenCV sees correct orientation ──
+                rotation = vid_info["rotate_tag"] or vid_info["display_matrix_rotation"]
+                if rotation in (90, 180, 270):
+                    rotated_input = tmp_input_path.replace(
+                        os.path.splitext(tmp_input_path)[1], "_rotfix.mp4"
+                    )
+                    if rotation == 90:
+                        vf = "transpose=1"
+                    elif rotation == 270:
+                        vf = "transpose=2"
+                    elif rotation == 180:
+                        vf = "transpose=1,transpose=1"
+                    subprocess.run([
+                        "ffmpeg", "-y", "-i", tmp_input_path,
+                        "-vf", vf,
+                        "-metadata:s:v:0", "rotate=0",
+                        "-c:v", "libx264", "-crf", "18",
+                        "-preset", "fast", "-pix_fmt", "yuv420p",
+                        rotated_input
+                    ], check=True)
+                    processing_input = rotated_input
+                else:
+                    processing_input = tmp_input_path
+                # ────────────────────────────────────────────────────────────────────────────
 
                 status   = st.empty()
                 prog     = st.progress(0)
