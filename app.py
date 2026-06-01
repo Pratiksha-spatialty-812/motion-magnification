@@ -512,16 +512,32 @@ if uploaded_file:
                         vf = "transpose=2"
                     elif rotation == 180:
                         vf = "transpose=1,transpose=1"
+
                     with st.spinner(f"🔄 Normalising rotation ({rotation}°)…"):
-                        subprocess.run([
-                            "ffmpeg", "-y", "-i", tmp_input_path,
-                            "-vf", vf,
-                            "-metadata:s:v:0", "rotate=0",
-                            "-c:v", "libx264", "-crf", "18",
-                            "-preset", "fast", "-pix_fmt", "yuv420p",
-                            rotated_input
-                        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        _rot_stderr = tempfile.mktemp(suffix=".txt")
+                        with open(_rot_stderr, "wb") as _ef:
+                            _rot_result = subprocess.run([
+                                "ffmpeg", "-y", "-i", tmp_input_path,
+                                "-vf", vf,
+                                "-metadata:s:v:0", "rotate=0",
+                                "-c:v", "libx264", "-crf", "18",
+                                "-preset", "fast", "-pix_fmt", "yuv420p",
+                                rotated_input
+                            ], stdout=subprocess.DEVNULL, stderr=_ef)
+
+                        if _rot_result.returncode != 0 or not os.path.exists(rotated_input) or os.path.getsize(rotated_input) == 0:
+                            with open(_rot_stderr, "r", errors="replace") as _ef:
+                                _rot_err_text = _ef.read()[-2000:]
+                            st.error(f"❌ Rotation fix failed (exit {_rot_result.returncode}):\n```\n{_rot_err_text}\n```")
+                            st.stop()
+
+                        try:
+                            os.unlink(_rot_stderr)
+                        except OSError:
+                            pass
+
                     processing_input = rotated_input
+                    st.success(f"✅ Rotation normalised → {rotated_input}")
                 else:
                     processing_input = tmp_input_path
                 with st.expander("🔍 Debug rotation info", expanded=False):
