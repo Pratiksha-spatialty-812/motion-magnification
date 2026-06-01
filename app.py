@@ -517,14 +517,18 @@ if uploaded_file:
                         _rot_stderr = tempfile.mktemp(suffix=".txt")
                         with open(_rot_stderr, "wb") as _ef:
                             _rot_result = subprocess.run([
-                                "ffmpeg", "-y", "-i", tmp_input_path,
-                                "-vf", vf,
+                                "ffmpeg", "-y",
+                                "-noautorotate",
+                                "-i", tmp_input_path,
+                                "-vf", f"{vf},format=yuv420p",
                                 "-metadata:s:v:0", "rotate=0",
                                 "-c:v", "libx264", "-crf", "18",
-                                "-preset", "fast", "-pix_fmt", "yuv420p",
+                                "-preset", "fast",
+                                "-pix_fmt", "yuv420p",
+                                "-map", "0:v:0",
+                                "-an",
                                 rotated_input
                             ], stdout=subprocess.DEVNULL, stderr=_ef)
-
                         if _rot_result.returncode != 0 or not os.path.exists(rotated_input) or os.path.getsize(rotated_input) == 0:
                             with open(_rot_stderr, "r", errors="replace") as _ef:
                                 _rot_err_text = _ef.read()[-2000:]
