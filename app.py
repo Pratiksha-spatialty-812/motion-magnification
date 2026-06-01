@@ -517,7 +517,7 @@ if uploaded_file:
                 try:
                     status.info("🔄 Processing frames… (piping directly to H.264)")
                     final_path = process_video(
-                        input_path=processing_input,
+                        input_path=tmp_input_path,
                         output_path=out_path,
                         alpha=alpha,
                         lambda_c=lambda_c,
