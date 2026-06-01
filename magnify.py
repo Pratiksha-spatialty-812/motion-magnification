@@ -171,7 +171,8 @@ def _detect_rotation(input_path: str) -> int:
     1. Simple 'rotate' stream tag  (Android, older cameras, many MP4s).
     2. 'side_data' display matrix  (iPhone iOS 14+, newer .mov files).
 
-    Uses a temp file for stderr to avoid pipe-buffer issues on slow systems.
+    Always reads from the ORIGINAL file path — never from an interim
+    transcode — so the rotation tag is never missing.
     """
     stderr_tmp = None
 
@@ -222,7 +223,6 @@ def _detect_rotation(input_path: str) -> int:
             )
         val2 = probe2.stdout.decode(errors="replace").strip()
         if val2 and val2.lstrip("-").isdigit():
-            # Display matrix stores NEGATIVE rotation; normalise to 0/90/180/270
             return (-int(val2)) % 360
     except Exception:
         pass
@@ -280,19 +280,20 @@ def _apply_rotation(frame: np.ndarray, rot: int) -> np.ndarray:
     return frame
 
 
-def _open_video_capture(input_path: str, codec: str) -> cv2.VideoCapture:
+def _open_video_capture(input_path: str, codec: str) -> tuple:
     """
     Open a VideoCapture, with a special pre-transcode path for HEVC/H.265
     (iPhone) videos that OpenCV cannot decode natively.
 
-    For HEVC inputs we use ffmpeg to pipe raw BGR frames into a temporary
-    intermediate file that OpenCV CAN read (MJPEG or uncompressed AVI),
-    then return a VideoCapture on that temp file.
+    IMPORTANT: the MJPEG transcode uses -noautorotate so ffmpeg does NOT
+    bake the rotation into the pixel data.  Rotation is handled separately
+    by _apply_rotation(), which reads the tag from the ORIGINAL file.
+    Without -noautorotate, ffmpeg auto-rotates during transcode AND
+    _apply_rotation rotates again → double rotation → wrong orientation.
 
     Returns (cap, temp_path_or_None).  Caller must release cap and, if
     temp_path is not None, delete it when done.
     """
-    # OpenCV usually cannot decode HEVC.  Transcode to a fast intermediate.
     if codec in ("hevc", "h265", "h.265"):
         tmp_path = tempfile.mktemp(suffix="_interim.avi")
         stderr_tmp = tempfile.mktemp(suffix=".txt")
@@ -301,10 +302,13 @@ def _open_video_capture(input_path: str, codec: str) -> cv2.VideoCapture:
                 r = subprocess.run(
                     [
                         "ffmpeg", "-y",
+                        "-noautorotate",       # ← KEY FIX: do NOT bake rotation
+                                               #   into pixel data; _apply_rotation
+                                               #   handles it from the original tag
                         "-ignore_editlist", "1",
                         "-i", input_path,
-                        "-c:v", "mjpeg",       # MJPEG is fast and OpenCV reads it
-                        "-q:v", "3",           # near-lossless quality
+                        "-c:v", "mjpeg",
+                        "-q:v", "3",
                         "-an",
                         tmp_path,
                     ],
@@ -328,8 +332,6 @@ def _open_video_capture(input_path: str, codec: str) -> cv2.VideoCapture:
                 os.unlink(stderr_tmp)
             except OSError:
                 pass
-        # If MJPEG transcode failed, fall through to direct open (may still work
-        # if the system ffmpeg is linked into OpenCV)
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -359,26 +361,25 @@ def process_video(
     """
     Process a video file with Eulerian motion magnification.
 
-    Key design points
+    Rotation handling
     -----------------
-    * HEVC / iPhone videos: detected via ffprobe; transcoded to a fast MJPEG
-      intermediate that OpenCV can decode before processing begins.
-    * EXIF / container rotation: detected via ffprobe (both simple tag AND
-      display-matrix side data) and baked into pixel data with _apply_rotation().
-      Portrait phone videos stay portrait.
-    * Frames piped directly to ffmpeg (libx264) — no huge intermediate raw file.
-    * _even() guarantees minimum dimension of 2 — never produces 0-width output.
-    * First frame written to the ffmpeg pipe is the same prepared frame Magnify
-      was initialised with — prevents any dimension mismatch on frame 1.
-    * ffmpeg stderr written to a temp file to avoid pipe-buffer deadlock on
-      long/HD videos.
-    * Temp intermediate file (for HEVC) is cleaned up in a finally block.
-    """
-    # ── Detect codec and rotation BEFORE opening VideoCapture ────────────────
-    codec    = _detect_codec(input_path)
-    rotation = _detect_rotation(input_path)
+    Rotation is ALWAYS detected from the original input_path (before any
+    HEVC transcode).  The HEVC→MJPEG transcode is done with -noautorotate
+    so ffmpeg never touches the pixel orientation — _apply_rotation() is
+    the single, authoritative place that corrects the frame.
 
-    # ── Open VideoCapture (with HEVC workaround if needed) ───────────────────
+    This prevents the double-rotation bug where:
+      1. ffmpeg auto-rotates during HEVC transcode
+      2. _apply_rotation rotates again
+      → output is rotated 90° the wrong way
+    """
+    # ── Detect codec and rotation from the ORIGINAL file ─────────────────────
+    # Must happen before _open_video_capture so we always read the real tag,
+    # not a stripped interim file.
+    codec    = _detect_codec(input_path)
+    rotation = _detect_rotation(input_path)   # reads from original, always correct
+
+    # ── Open VideoCapture (HEVC transcode uses -noautorotate) ─────────────────
     cap, interim_path = _open_video_capture(input_path, codec)
 
     if not cap.isOpened():
@@ -392,9 +393,11 @@ def process_video(
         raw_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # After applying rotation, logical frame dimensions may be swapped
+        # After applying rotation, logical frame dimensions may be swapped.
+        # For HEVC with -noautorotate the interim file still has raw (unrotated)
+        # dimensions, so raw_w/raw_h are the pre-rotation values — correct.
         if rotation in (90, 270):
-            orig_w, orig_h = raw_h, raw_w   # portrait phone video
+            orig_w, orig_h = raw_h, raw_w
         else:
             orig_w, orig_h = raw_w, raw_h
 
@@ -416,11 +419,9 @@ def process_video(
                 frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
             return frame
 
-        # ── ffmpeg stderr goes to a temp file — avoids pipe-buffer deadlock ───
         stderr_tmp  = tempfile.mktemp(suffix=".txt")
         stderr_file = None
 
-        # ── Spin up ffmpeg — raw BGR stdin → H.264 output ─────────────────────
         ffmpeg_cmd = [
             "ffmpeg", "-y",
             "-f", "rawvideo",
@@ -434,8 +435,8 @@ def process_video(
             "-preset", "fast",
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
-            # Rotation has been baked in — clear residual tag so players
-            # don't double-rotate the output.
+            # Rotation is baked into pixels — clear any residual tag so
+            # players don't attempt a second rotation on playback.
             "-metadata:s:v:0", "rotate=0",
             output_path,
         ]
@@ -459,7 +460,7 @@ def process_video(
                 if not ret:
                     raise ValueError("Failed to read first frame from video.")
 
-                img1 = _prepare(raw1)   # rotate + resize
+                img1 = _prepare(raw1)
 
                 magnifier = Magnify(
                     img1,
@@ -467,7 +468,7 @@ def process_video(
                     n_levels=n_levels,
                     alpha_curve=alpha_curve,
                 )
-                ffmpeg_proc.stdin.write(img1.tobytes())   # pipe the prepared frame
+                ffmpeg_proc.stdin.write(img1.tobytes())
 
                 frame_count = 1
                 while cap.isOpened():
@@ -506,7 +507,6 @@ def process_video(
 
     finally:
         cap.release()
-        # Clean up the HEVC interim transcode temp file if one was created
         if interim_path:
             try:
                 os.unlink(interim_path)
@@ -615,6 +615,8 @@ def analyze_vibration(
     freqs     = np.fft.rfftfreq(N, d=1.0 / fps)
     power     = (np.abs(fft_vals) ** 2) / N
 
+    # Remove DC component (0 Hz bin) — it's the static mean offset,
+    # not a vibration frequency, and would otherwise dominate argmax.
     if len(freqs) > 1:
         freqs = freqs[1:]
         power = power[1:]
