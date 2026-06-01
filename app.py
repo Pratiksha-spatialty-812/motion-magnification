@@ -652,9 +652,8 @@ else:
         canvas_html = f"""
 <style>
   body {{ margin:0; background:transparent; font-family:'Space Mono',monospace; }}
-  canvas {{ display:block; cursor:crosshair; border-radius:8px;
-            border:2px solid #2d2d4e; max-width:100%; }}
-  #hint {{ font-size:0.7rem; color:#6b7280; margin:5px 0 6px; }}
+  canvas {{ display:block; border-radius:8px; border:2px solid #2d2d4e; max-width:100%; }}
+  #hint {{ font-size:0.7rem; color:#6b7280; margin:5px 0 4px; }}
   #lbl  {{ font-size:0.75rem; color:#38bdf8; background:#13131f;
            border:1px solid #1e1e30; border-radius:5px;
            padding:4px 10px; display:inline-block; margin-bottom:6px; }}
@@ -665,71 +664,273 @@ else:
   #btn.ok {{ background:linear-gradient(135deg,#059669,#0284c7); }}
 </style>
 <canvas id="c" width="{CANVAS_W}" height="{CANVAS_H}"></canvas>
-<div id="hint">Drag to draw ROI, then click Confirm ROI.</div>
+<div id="hint">Draw a box · then drag corners/edges to resize · drag inside to move</div>
 <div id="lbl">No ROI drawn yet</div><br>
 <button id="btn" onclick="confirm_roi()">✅ Confirm ROI</button>
 <script>
 const C   = document.getElementById('c');
 const ctx = C.getContext('2d');
 const NW={CANVAS_W}, NH={CANVAS_H}, VW={m_w}, VH={m_h};
+
 const img = new Image();
-img.onload = () => ctx.drawImage(img, 0, 0, NW, NH);
+img.onload = () => render();
 img.src = 'data:image/jpeg;base64,{b64_frame}';
 
+// ── Box state (canvas pixels) ──────────────────────────────────────────────
+// r = {{ x, y, w, h }} — always kept normalised (w>0, h>0)
+let r = null;        // current box, null = none drawn yet
+let done = false;    // true once a usable box exists
+
+// ── Interaction state ──────────────────────────────────────────────────────
+// mode: 'none' | 'draw' | 'move' | 'resize'
+let mode = 'none';
+let dragStart = null;   // canvas-px {{x,y}} at pointer-down
+let boxSnap   = null;   // copy of r at pointer-down (for move/resize delta)
+const HIT = 10;         // px radius for handle hit-test
+
+// ── Hit-testing ────────────────────────────────────────────────────────────
+// Returns which part of the box the pointer is over, or null.
+// Parts: 'tl','tc','tr','ml','mr','bl','bc','br' = handles; 'body' = interior
+function hitTest(px, py) {{
+  if (!r) return null;
+  const {{x, y, w, h}} = r;
+  const cx = x + w/2, cy = y + h/2;
+  const handles = [
+    ['tl', x,    y   ], ['tc', cx,   y   ], ['tr', x+w, y   ],
+    ['ml', x,    cy  ],                      ['mr', x+w, cy  ],
+    ['bl', x,    y+h ], ['bc', cx,   y+h ], ['br', x+w, y+h ],
+  ];
+  for (const [name, hx, hy] of handles) {{
+    if (Math.abs(px-hx) <= HIT && Math.abs(py-hy) <= HIT) return name;
+  }}
+  if (px >= x && px <= x+w && py >= y && py <= y+h) return 'body';
+  return null;
+}}
+
+// ── Cursor map ─────────────────────────────────────────────────────────────
+const CURSORS = {{
+  tl:'nwse-resize', br:'nwse-resize',
+  tr:'nesw-resize', bl:'nesw-resize',
+  tc:'ns-resize',   bc:'ns-resize',
+  ml:'ew-resize',   mr:'ew-resize',
+  body:'move', null:'crosshair', none:'crosshair'
+}};
+
+// ── Canvas → video-pixel coords ───────────────────────────────────────────
+function toVid(cx, cy) {{
+  return [Math.round(cx * VW / NW), Math.round(cy * VH / NH)];
+}}
+function vidBox() {{
+  if (!r) return null;
+  const [vx, vy] = toVid(r.x, r.y);
+  const [vx2,vy2]= toVid(r.x+r.w, r.y+r.h);
+  return {{ x:vx, y:vy, w:vx2-vx, h:vy2-vy }};
+}}
+
+// ── Pointer helpers ────────────────────────────────────────────────────────
 function pt(e) {{
-  const r = C.getBoundingClientRect();
-  const s = e.touches ? e.touches[0] : e;
-  return [(s.clientX - r.left) * (NW / r.width),
-          (s.clientY - r.top)  * (NH / r.height)];
-}}
-let drawing=false, sx=0, sy=0, box={{}}, done=false;
-function draw_box(x,y,w,h) {{
-  ctx.save();
-  ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]);
-  ctx.strokeRect(x,y,w,h);
-  ctx.fillStyle='rgba(245,158,11,0.12)'; ctx.fillRect(x,y,w,h);
-  ctx.restore();
-}}
-function redraw(ex,ey) {{
-  ctx.clearRect(0,0,NW,NH); ctx.drawImage(img,0,0,NW,NH);
-  draw_box(Math.min(sx,ex),Math.min(sy,ey),
-           Math.abs(ex-sx),Math.abs(ey-sy));
-}}
-function to_vid(cx,cy,ex,ey) {{
+  const rc = C.getBoundingClientRect();
+  const s  = e.touches ? e.touches[0] : e;
   return {{
-    x: Math.round(Math.min(cx,ex)*VW/NW),
-    y: Math.round(Math.min(cy,ey)*VH/NH),
-    w: Math.round(Math.abs(ex-cx)*VW/NW),
-    h: Math.round(Math.abs(ey-cy)*VH/NH),
+    x: (s.clientX - rc.left) * (NW / rc.width),
+    y: (s.clientY - rc.top)  * (NH / rc.height),
   }};
 }}
-function set_label(b) {{
-  document.getElementById('lbl').innerText =
-    'ROI → x:'+b.x+' y:'+b.y+' w:'+b.w+' h:'+b.h;
-}}
-C.addEventListener('mousedown', e=>{{
-  [sx,sy]=pt(e); drawing=true; done=false; e.preventDefault(); }});
-C.addEventListener('mousemove', e=>{{
-  if(!drawing) return;
-  const [ex,ey]=pt(e); redraw(ex,ey);
-  set_label(to_vid(sx,sy,ex,ey)); e.preventDefault(); }});
-C.addEventListener('mouseup', e=>{{
-  if(!drawing) return; drawing=false;
-  const [ex,ey]=pt(e); redraw(ex,ey);
-  box=to_vid(sx,sy,ex,ey); set_label(box); done=true; e.preventDefault(); }});
-C.addEventListener('touchstart', e=>{{
-  [sx,sy]=pt(e); drawing=true; done=false; e.preventDefault(); }},{{passive:false}});
-C.addEventListener('touchmove', e=>{{
-  if(!drawing) return;
-  const [ex,ey]=pt(e); redraw(ex,ey); e.preventDefault(); }},{{passive:false}});
-C.addEventListener('touchend', e=>{{
-  if(!drawing) return; drawing=false;
-  const [ex,ey]=pt(e);
-  box=to_vid(sx,sy,ex,ey); set_label(box); done=true; e.preventDefault(); }},{{passive:false}});
 
+// ── Clamp box inside canvas ───────────────────────────────────────────────
+function clamp(box) {{
+  let {{x, y, w, h}} = box;
+  const MIN = 8;
+  w = Math.max(MIN, w);  h = Math.max(MIN, h);
+  x = Math.max(0, Math.min(NW - w, x));
+  y = Math.max(0, Math.min(NH - h, y));
+  return {{x, y, w, h}};
+}}
+
+// ── Render ─────────────────────────────────────────────────────────────────
+function render() {{
+  ctx.clearRect(0, 0, NW, NH);
+  ctx.drawImage(img, 0, 0, NW, NH);
+  if (!r) return;
+
+  // semi-transparent fill
+  ctx.fillStyle = 'rgba(245,158,11,0.13)';
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+
+  // dashed border
+  ctx.save();
+  ctx.strokeStyle = '#f59e0b';
+  ctx.lineWidth   = 2;
+  ctx.setLineDash([5, 3]);
+  ctx.strokeRect(r.x, r.y, r.w, r.h);
+  ctx.restore();
+
+  // handles — 8 circles at corners + edge midpoints
+  const cx = r.x + r.w/2, cy = r.y + r.h/2;
+  const handles = [
+    [r.x,    r.y   ], [cx,    r.y   ], [r.x+r.w, r.y   ],
+    [r.x,    cy    ],                   [r.x+r.w, cy    ],
+    [r.x,    r.y+r.h], [cx,   r.y+r.h], [r.x+r.w, r.y+r.h],
+  ];
+  for (const [hx, hy] of handles) {{
+    ctx.beginPath();
+    ctx.arc(hx, hy, 6, 0, Math.PI*2);
+    ctx.fillStyle   = '#f59e0b';
+    ctx.fill();
+    ctx.strokeStyle = '#0a0a0f';
+    ctx.lineWidth   = 1.5;
+    ctx.stroke();
+  }}
+
+  // label inside box (top-left corner)
+  const vb = vidBox();
+  if (vb) {{
+    const txt = `${{vb.x}},${{vb.y}}  ${{vb.w}}×${{vb.h}}`;
+    ctx.font      = 'bold 11px Space Mono, monospace';
+    ctx.fillStyle = 'rgba(10,10,15,0.72)';
+    ctx.fillRect(r.x+4, r.y+4, ctx.measureText(txt).width+8, 18);
+    ctx.fillStyle = '#f59e0b';
+    ctx.fillText(txt, r.x+8, r.y+16);
+  }}
+}}
+
+function updateLabel() {{
+  const vb = vidBox();
+  if (vb) {{
+    document.getElementById('lbl').innerText =
+      'ROI → x:'+vb.x+'  y:'+vb.y+'  w:'+vb.w+'  h:'+vb.h;
+  }}
+}}
+
+// ── Pointer down ───────────────────────────────────────────────────────────
+function onDown(e) {{
+  e.preventDefault();
+  const p   = pt(e);
+  const hit = hitTest(p.x, p.y);
+
+  if (hit && hit !== 'none') {{
+    // Adjust existing box
+    mode      = (hit === 'body') ? 'move' : 'resize';
+    dragStart = p;
+    boxSnap   = {{ ...r }};
+  }} else {{
+    // Start drawing a new box
+    mode      = 'draw';
+    dragStart = p;
+    r         = {{ x: p.x, y: p.y, w: 0, h: 0 }};
+    done      = false;
+  }}
+}}
+
+// ── Pointer move ───────────────────────────────────────────────────────────
+function onMove(e) {{
+  e.preventDefault();
+  const p = pt(e);
+
+  // Update cursor when hovering (no drag)
+  if (mode === 'none') {{
+    const hit = hitTest(p.x, p.y);
+    C.style.cursor = CURSORS[hit] || 'crosshair';
+    return;
+  }}
+
+  const dx = p.x - dragStart.x;
+  const dy = p.y - dragStart.y;
+
+  if (mode === 'draw') {{
+    r = clamp({{
+      x: Math.min(dragStart.x, p.x),
+      y: Math.min(dragStart.y, p.y),
+      w: Math.abs(p.x - dragStart.x),
+      h: Math.abs(p.y - dragStart.y),
+    }});
+
+  }} else if (mode === 'move') {{
+    r = clamp({{
+      x: boxSnap.x + dx,
+      y: boxSnap.y + dy,
+      w: boxSnap.w,
+      h: boxSnap.h,
+    }});
+
+  }} else if (mode === 'resize') {{
+    let {{x, y, w, h}} = boxSnap;
+    const hit = hitTest(dragStart.x, dragStart.y) ||
+                hitTestSnap(dragStart.x, dragStart.y);
+
+    // Which edges move for each handle
+    if (hit === 'tl') {{ x += dx; y += dy; w -= dx; h -= dy; }}
+    else if (hit === 'tc') {{               y += dy;           h -= dy; }}
+    else if (hit === 'tr') {{               y += dy; w += dx;  h -= dy; }}
+    else if (hit === 'ml') {{ x += dx;               w -= dx;          }}
+    else if (hit === 'mr') {{                         w += dx;          }}
+    else if (hit === 'bl') {{ x += dx;               w -= dx;  h += dy; }}
+    else if (hit === 'bc') {{                                   h += dy; }}
+    else if (hit === 'br') {{                         w += dx;  h += dy; }}
+
+    // Prevent negative size — flip axes
+    if (w < 8) {{ if (hit && hit[1]==='l') x -= (8-w); w = 8; }}
+    if (h < 8) {{ if (hit && hit[0]==='t') y -= (8-h); h = 8; }}
+    r = clamp({{ x: Math.min(x, x+w), y: Math.min(y, y+h),
+                 w: Math.abs(w),       h: Math.abs(h) }});
+  }}
+
+  updateLabel();
+  render();
+}}
+
+// Store the handle name that was active at dragStart for resize
+let _resizeHandle = null;
+function hitTestSnap(px, py) {{ return _resizeHandle; }}
+
+// ── Pointer up ─────────────────────────────────────────────────────────────
+function onUp(e) {{
+  e.preventDefault();
+  if (mode !== 'none') {{
+    done = (r && r.w >= 8 && r.h >= 8);
+    updateLabel();
+    render();
+  }}
+  mode = 'none';
+  _resizeHandle = null;
+}}
+
+// Override onDown to also capture the handle name for resize
+const _origDown = onDown;
+C.removeEventListener && C.removeEventListener('mousedown', onDown);
+
+function onDownFull(e) {{
+  e.preventDefault();
+  const p   = pt(e);
+  const hit = hitTest(p.x, p.y);
+  if (hit && hit !== 'none' && hit !== 'body') {{
+    _resizeHandle = hit;
+  }}
+  _origDown(e);
+}}
+
+// ── Wire events (mouse + touch) ────────────────────────────────────────────
+C.addEventListener('mousedown',  onDownFull, {{passive:false}});
+C.addEventListener('mousemove',  onMove,     {{passive:false}});
+C.addEventListener('mouseup',    onUp,       {{passive:false}});
+C.addEventListener('mouseleave', onUp,       {{passive:false}});
+
+C.addEventListener('touchstart', e => {{
+  _resizeHandle = hitTest(pt(e).x, pt(e).y);
+  if (_resizeHandle === 'body' || _resizeHandle === null) _resizeHandle = null;
+  onDownFull(e);
+}}, {{passive:false}});
+C.addEventListener('touchmove',  onMove, {{passive:false}});
+C.addEventListener('touchend',   onUp,   {{passive:false}});
+
+// ── Confirm ────────────────────────────────────────────────────────────────
 function confirm_roi() {{
-  if(!done || box.w<4 || box.h<4) {{ alert('Draw a larger box first.'); return; }}
-  const val = box.x+','+box.y+','+box.w+','+box.h;
+  if (!done || !r || r.w < 8 || r.h < 8) {{
+    alert('Draw a box first (drag on the image).');
+    return;
+  }}
+  const vb  = vidBox();
+  const val = vb.x+','+vb.y+','+vb.w+','+vb.h;
   const url = new URL(window.parent.location.href);
   url.searchParams.set('roi', val);
   window.parent.history.pushState({{}}, '', url);
@@ -739,7 +940,7 @@ function confirm_roi() {{
 }}
 </script>
 """
-        components.html(canvas_html, height=CANVAS_H + 140, scrolling=False)
+        components.html(canvas_html, height=CANVAS_H + 150, scrolling=False)
 
         col_confirm, col_clear = st.columns([3, 1])
         with col_confirm:
