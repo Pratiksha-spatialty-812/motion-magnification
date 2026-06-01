@@ -524,7 +524,9 @@ if uploaded_file:
                     processing_input = rotated_input
                 else:
                     processing_input = tmp_input_path
-    
+                with st.expander("🔍 Debug rotation info", expanded=False):
+                    st.write(f"rotate_tag: {_rot_tag}, display_matrix: {_rot_matrix}, final rotation: {rotation}")
+                    st.write(f"processing_input: {processing_input}")
                 # ────────────────────────────────────────────────────────────────────────────
 
                 status   = st.empty()
