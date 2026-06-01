@@ -144,6 +144,11 @@ for k, v in [
     ("last_upload_name", None),
     # ── NEW: store the FPS actually used for encoding so analysis stays in sync
     ("processing_fps",   0.0),
+    # ── Persist vibration results so download buttons don't wipe the display
+    ("vibration_result", None),
+    ("vibration_fig_png", None),   # figure stored as PNG bytes
+    ("vibration_csv_m",  None),    # motion CSV string
+    ("vibration_csv_f",  None),    # FFT CSV string
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -396,9 +401,14 @@ if uploaded_file:
             st.session_state["orig_preview_path"] = None
             st.session_state["magnified_path"]   = None
             st.session_state["mag_vid_bytes"]    = None
-            st.session_state["confirmed_roi"]    = None
-            st.session_state["pending_roi"]      = None
-            st.session_state["processing_fps"]   = 0.0   # reset on new upload
+            st.session_state["confirmed_roi"]      = None
+            st.session_state["pending_roi"]        = None
+            st.session_state["processing_fps"]     = 0.0
+            st.session_state["vibration_result"]   = None
+            st.session_state["vibration_fig_png"]  = None
+            st.session_state["vibration_csv_m"]    = None
+            st.session_state["vibration_csv_f"]    = None
+            st.session_state["_last_analysis_roi"] = None
 
         tmp_input_path = st.session_state["orig_tmp_path"]
 
@@ -492,11 +502,16 @@ if uploaded_file:
             run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
 
             if run_btn:
-                st.session_state["magnified_path"] = None
-                st.session_state["mag_vid_bytes"]  = None
-                st.session_state["confirmed_roi"]  = None
-                st.session_state["pending_roi"]    = None
-                st.session_state["processing_fps"] = 0.0
+                st.session_state["magnified_path"]     = None
+                st.session_state["mag_vid_bytes"]      = None
+                st.session_state["confirmed_roi"]      = None
+                st.session_state["pending_roi"]        = None
+                st.session_state["processing_fps"]     = 0.0
+                st.session_state["vibration_result"]   = None
+                st.session_state["vibration_fig_png"]  = None
+                st.session_state["vibration_csv_m"]    = None
+                st.session_state["vibration_csv_f"]    = None
+                st.session_state["_last_analysis_roi"] = None
 
                 out_path = tmp_input_path.replace(
                     os.path.splitext(tmp_input_path)[1], "_magnified.mp4"
@@ -783,6 +798,13 @@ function confirm_roi() {{
             f"(matches encoding FPS — ensures correct frequency axis)"
         )
 
+        # Clear cached results whenever the ROI changes so stale data isn't shown
+        if st.session_state.get("confirmed_roi") != st.session_state.get("_last_analysis_roi"):
+            st.session_state["vibration_result"]  = None
+            st.session_state["vibration_fig_png"] = None
+            st.session_state["vibration_csv_m"]   = None
+            st.session_state["vibration_csv_f"]   = None
+
         if st.button("📊 Run Vibration Analysis", use_container_width=True):
             roi_tuple = st.session_state.get("confirmed_roi")
             if roi_tuple is None:
@@ -799,46 +821,77 @@ function confirm_roi() {{
                     result = analyze_vibration(
                         input_path=mag_path,
                         roi=roi_tuple,
-                        fps=m_fps,          # ← always the encoding FPS now
+                        fps=m_fps,
                         method=of_method,
                         progress_callback=_an_cb,
                     )
                     an_prog.progress(1.0)
                     an_status.success(f"✅ Analysis complete! (FPS used: {m_fps:.2f})")
 
-                    r1, r2, r3, r4 = st.columns(4)
-                    r1.metric("Dominant Freq", f"{result['dominant_hz']:.3f} Hz")
-                    r2.metric("Period",
-                              f"{1/result['dominant_hz']:.3f} s"
-                              if result["dominant_hz"] > 0 else "—")
-                    r3.metric("Amplitude", f"{result['dominant_amp']:.4f} px")
-                    r4.metric("Frames",    str(len(result["motion"])))
-
-                    fig = make_plot(result)
-                    st.pyplot(fig, use_container_width=True)
-                    plt.close(fig)
-
+                    # ── Build CSVs ────────────────────────────────────────────
                     csv_m = io.StringIO()
                     csv_m.write("time_s,motion_px_per_frame\n")
-                    for t, m in zip(result["times"], result["motion"]):
-                        csv_m.write(f"{t:.6f},{m:.6f}\n")
+                    for t, mv in zip(result["times"], result["motion"]):
+                        csv_m.write(f"{t:.6f},{mv:.6f}\n")
+
                     csv_f = io.StringIO()
                     csv_f.write("freq_hz,power\n")
-                    for f, p in zip(result["freqs"], result["power"]):
-                        csv_f.write(f"{f:.6f},{p:.6f}\n")
+                    for fv, pv in zip(result["freqs"], result["power"]):
+                        csv_f.write(f"{fv:.6f},{pv:.6f}\n")
 
-                    dl1, dl2 = st.columns(2)
-                    with dl1:
-                        st.download_button("⬇️ Motion Signal (CSV)", csv_m.getvalue(),
-                                           "motion_signal.csv", "text/csv",
-                                           use_container_width=True)
-                    with dl2:
-                        st.download_button("⬇️ FFT Spectrum (CSV)", csv_f.getvalue(),
-                                           "fft_spectrum.csv", "text/csv",
-                                           use_container_width=True)
+                    # ── Render figure and save as PNG bytes ───────────────────
+                    fig = make_plot(result)
+                    png_buf = io.BytesIO()
+                    fig.savefig(png_buf, format="png", dpi=120,
+                                bbox_inches="tight", facecolor="#0d0d18")
+                    png_buf.seek(0)
+                    plt.close(fig)
+
+                    # ── Persist everything to session state ───────────────────
+                    # Results are stored here so that clicking a download button
+                    # (which triggers a Streamlit re-run) does NOT wipe the display.
+                    st.session_state["vibration_result"]  = result
+                    st.session_state["vibration_fig_png"] = png_buf.getvalue()
+                    st.session_state["vibration_csv_m"]   = csv_m.getvalue()
+                    st.session_state["vibration_csv_f"]   = csv_f.getvalue()
+                    st.session_state["_last_analysis_roi"] = roi_tuple
 
                 except Exception as e:
                     an_status.error(f"❌ {e}")
+
+        # ── Display results — rendered on EVERY re-run as long as session state
+        #    holds data, so download-button clicks never wipe the section. ─────
+        result = st.session_state.get("vibration_result")
+        if result is not None:
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Dominant Freq", f"{result['dominant_hz']:.3f} Hz")
+            r2.metric("Period",
+                      f"{1/result['dominant_hz']:.3f} s"
+                      if result["dominant_hz"] > 0 else "—")
+            r3.metric("Amplitude", f"{result['dominant_amp']:.4f} px")
+            r4.metric("Frames",    str(len(result["motion"])))
+
+            fig_png = st.session_state.get("vibration_fig_png")
+            if fig_png:
+                st.image(fig_png, use_container_width=True)
+
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                st.download_button(
+                    "⬇️ Motion Signal (CSV)",
+                    data=st.session_state["vibration_csv_m"],
+                    file_name="motion_signal.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            with dl2:
+                st.download_button(
+                    "⬇️ FFT Spectrum (CSV)",
+                    data=st.session_state["vibration_csv_f"],
+                    file_name="fft_spectrum.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
         else:
             if not st.session_state.get("confirmed_roi"):
                 st.info("Draw and confirm an ROI above, then click **Run Vibration Analysis**.")
