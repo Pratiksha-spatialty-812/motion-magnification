@@ -19,18 +19,10 @@ from magnify import process_video, analyze_vibration, ALPHA_CURVES
 _FFMPEG_DIR = "/tmp/ffmpeg_bin"
 
 def _ensure_ffmpeg():
-    """
-    Ensure ffmpeg/ffprobe are available.
-    - If already on PATH (system install), add nothing but verify.
-    - Otherwise download a static GPL build into /tmp/ffmpeg_bin and
-      prepend that dir to PATH so all subprocess calls find it.
-    """
-    # Check if a working ffmpeg is already on PATH
     r = subprocess.run(["which", "ffmpeg"], capture_output=True)
     if r.returncode == 0:
-        return  # system ffmpeg is fine
+        return
 
-    # Already downloaded in a previous Streamlit rerun?
     if os.path.isfile(os.path.join(_FFMPEG_DIR, "ffmpeg")):
         _prepend_path()
         return
@@ -46,7 +38,7 @@ def _ensure_ffmpeg():
     with _tarfile.open(local) as t:
         for m in t.getmembers():
             if m.name.endswith("/ffmpeg") or m.name.endswith("/ffprobe"):
-                m.name = os.path.basename(m.name)   # strip directory prefix
+                m.name = os.path.basename(m.name)
                 t.extract(m, _FFMPEG_DIR)
     os.chmod(os.path.join(_FFMPEG_DIR, "ffmpeg"),  0o755)
     os.chmod(os.path.join(_FFMPEG_DIR, "ffprobe"), 0o755)
@@ -57,7 +49,6 @@ def _ensure_ffmpeg():
     _prepend_path()
 
 def _prepend_path():
-    """Add our static binary dir to the front of PATH for this process."""
     current = os.environ.get("PATH", "")
     if _FFMPEG_DIR not in current:
         os.environ["PATH"] = _FFMPEG_DIR + ":" + current
@@ -151,6 +142,8 @@ for k, v in [
     ("confirmed_roi",    None),
     ("pending_roi",      None),
     ("last_upload_name", None),
+    # ── NEW: store the FPS actually used for encoding so analysis stays in sync
+    ("processing_fps",   0.0),
 ]:
     if k not in st.session_state:
         st.session_state[k] = v
@@ -234,11 +227,6 @@ def _get_video_info(input_path: str) -> dict:
 
 
 def prepare_browser_preview(input_path: str, out_path: str) -> bool:
-    """
-    Re-encode input_path to a browser-compatible H.264 MP4 saved at out_path.
-    Caps preview at 480p to keep RAM/disk low on Streamlit Cloud.
-    Returns True on success. Never loads video into Python memory.
-    """
     stderr_tmp = tempfile.mktemp(suffix=".txt")
     try:
         vid_info = _get_video_info(input_path)
@@ -253,8 +241,6 @@ def prepare_browser_preview(input_path: str, out_path: str) -> bool:
         else:
             rotate_filter = ""
 
-        # Cap preview at 480p — saves RAM and /tmp space
-        # Simple: scale longest side to 854, force even dims
         scale_480 = "scale=640:360:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2"
         vf_plain        = scale_480
         vf_with_rotate  = f"{rotate_filter}{scale_480}"
@@ -349,8 +335,13 @@ with st.sidebar:
     fl = st.slider("fl (Hz)", 0.1, 10.0, 1.0, 0.1)
     st.markdown('<div class="param-label">fh — High Cutoff (Hz)</div>', unsafe_allow_html=True)
     fh = st.slider("fh (Hz)", 1.0, 30.0, 14.0, 0.5)
-    st.markdown('<div class="param-label">FPS</div>', unsafe_allow_html=True)
-    fps_sidebar = st.slider("FPS", 15, 60, 30, 1)
+
+    # ── FPS: show the detected native FPS as the default, allow override ──────
+    st.markdown('<div class="param-label">FPS (0 = use source FPS)</div>', unsafe_allow_html=True)
+    fps_override = st.slider("FPS override", 0, 120, 0, 1,
+                             help="Set to 0 to automatically use the uploaded video's native FPS. "
+                                  "Set a positive value to force a specific frame rate.")
+
     st.markdown("---")
     n_levels_raw = st.slider("Pyramid Levels (0=auto)", 0, 8, 0, 1)
     n_levels = None if n_levels_raw == 0 else n_levels_raw
@@ -407,6 +398,7 @@ if uploaded_file:
             st.session_state["mag_vid_bytes"]    = None
             st.session_state["confirmed_roi"]    = None
             st.session_state["pending_roi"]      = None
+            st.session_state["processing_fps"]   = 0.0   # reset on new upload
 
         tmp_input_path = st.session_state["orig_tmp_path"]
 
@@ -446,6 +438,13 @@ if uploaded_file:
 
         duration = total_frames / vid_fps if vid_fps > 0 else vid_info["duration"]
 
+        # ── Resolve the FPS that will actually be used for processing ─────────
+        # fps_override == 0  →  use the video's native FPS (correct for analysis)
+        # fps_override  > 0  →  honour the user's manual override
+        effective_fps = float(fps_override) if fps_override > 0 else (
+            float(vid_fps) if vid_fps > 0 else 30.0
+        )
+
         left_up, right_up = st.columns([1, 1], gap="large")
 
         with left_up:
@@ -468,7 +467,7 @@ if uploaded_file:
 
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Resolution", f"{vid_w}×{vid_h}")
-            m2.metric("FPS", f"{vid_fps:.0f}" if vid_fps else "—")
+            m2.metric("FPS", f"{vid_fps:.2f}" if vid_fps else "—")
             m3.metric("Duration", f"{duration:.1f}s" if duration else "—")
             m4.metric("Size", f"{file_size_mb:.1f} MB")
 
@@ -483,6 +482,13 @@ if uploaded_file:
             elif vid_w and vid_h:
                 st.caption(f"ℹ️ Will process at full {vid_w}×{vid_h}")
 
+            # Show which FPS will actually be used so the user isn't surprised
+            fps_note = (
+                f"native {vid_fps:.2f} fps" if fps_override == 0 and vid_fps > 0
+                else f"override {effective_fps:.0f} fps"
+            )
+            st.caption(f"🎞 Processing FPS: **{effective_fps:.2f}** ({fps_note})")
+
             run_btn = st.button("🚀 Run Motion Magnification", use_container_width=True)
 
             if run_btn:
@@ -490,16 +496,11 @@ if uploaded_file:
                 st.session_state["mag_vid_bytes"]  = None
                 st.session_state["confirmed_roi"]  = None
                 st.session_state["pending_roi"]    = None
+                st.session_state["processing_fps"] = 0.0
 
                 out_path = tmp_input_path.replace(
                     os.path.splitext(tmp_input_path)[1], "_magnified.mp4"
                 )
-
-                status   = st.empty()
-                prog     = st.progress(0)
-                eta_slot = st.empty()
-                t0 = time.time()
-                # ────────────────────────────────────────────────────────────────────────────
 
                 status   = st.empty()
                 prog     = st.progress(0)
@@ -515,7 +516,7 @@ if uploaded_file:
                         )
 
                 try:
-                    status.info("🔄 Processing frames… (piping directly to H.264)")
+                    status.info(f"🔄 Processing frames at {effective_fps:.2f} fps… (piping directly to H.264)")
                     final_path = process_video(
                         input_path=tmp_input_path,
                         output_path=out_path,
@@ -523,7 +524,7 @@ if uploaded_file:
                         lambda_c=lambda_c,
                         fl=fl,
                         fh=fh,
-                        fps=fps_sidebar,
+                        fps=effective_fps,          # ← use native/overridden FPS
                         progress_callback=_cb,
                         n_levels=n_levels,
                         alpha_curve=alpha_curve,
@@ -546,8 +547,16 @@ if uploaded_file:
                     st.session_state["magnified_path"] = final_path
                     st.session_state["mag_vid_w"]      = out_w
                     st.session_state["mag_vid_h"]      = out_h
-                    st.session_state["mag_vid_fps"]    = out_fps if out_fps > 0 else float(fps_sidebar)
-                    status.success(f"✅ Done in {time.time()-t0:.1f}s — output: {out_w}×{out_h}")
+                    st.session_state["mag_vid_fps"]    = out_fps if out_fps > 0 else effective_fps
+                    # ── KEY FIX: store the FPS used for encoding so vibration
+                    #    analysis always uses the correct time axis, regardless
+                    #    of what cap_out.get() reports back.
+                    st.session_state["processing_fps"] = effective_fps
+
+                    status.success(
+                        f"✅ Done in {time.time()-t0:.1f}s — output: {out_w}×{out_h} "
+                        f"@ {effective_fps:.2f} fps"
+                    )
 
                 except Exception as e:
                     status.error(f"❌ {e}")
@@ -568,7 +577,8 @@ if uploaded_file:
 
 else:
     for k in ["orig_tmp_path", "orig_preview_path", "magnified_path",
-              "mag_vid_bytes", "confirmed_roi", "pending_roi", "last_upload_name"]:
+              "mag_vid_bytes", "confirmed_roi", "pending_roi", "last_upload_name",
+              "processing_fps"]:
         st.session_state[k] = None
     st.info("Upload a video above, tune parameters in the sidebar, then click **Run Motion Magnification**.")
 
@@ -590,7 +600,13 @@ else:
 
     m_w   = st.session_state["mag_vid_w"]
     m_h   = st.session_state["mag_vid_h"]
-    m_fps = st.session_state["mag_vid_fps"]
+    # ── Use processing_fps (the FPS the video was actually encoded at) ────────
+    # Fall back to mag_vid_fps, then to 30 as a last resort.
+    m_fps = (
+        st.session_state.get("processing_fps")
+        or st.session_state.get("mag_vid_fps")
+        or 30.0
+    )
 
     cap_m = cv2.VideoCapture(mag_path)
     ret_m, first_frame = cap_m.read()
@@ -761,6 +777,12 @@ function confirm_roi() {{
         st.markdown("---")
         st.markdown('<div class="step-badge done">STEP 3 — Vibration Analysis</div>', unsafe_allow_html=True)
 
+        # Show the user which FPS will be used for the frequency axis
+        st.caption(
+            f"📐 Analysis FPS: **{m_fps:.2f} fps** "
+            f"(matches encoding FPS — ensures correct frequency axis)"
+        )
+
         if st.button("📊 Run Vibration Analysis", use_container_width=True):
             roi_tuple = st.session_state.get("confirmed_roi")
             if roi_tuple is None:
@@ -768,19 +790,21 @@ function confirm_roi() {{
             else:
                 an_status = st.empty()
                 an_prog   = st.progress(0)
-                an_status.info("🔄 Computing optical flow on magnified video…")
+                an_status.info(f"🔄 Computing optical flow on magnified video at {m_fps:.2f} fps…")
 
                 def _an_cb(cur, tot):
                     an_prog.progress(min(cur / tot, 1.0))
 
                 try:
                     result = analyze_vibration(
-                        input_path=mag_path, roi=roi_tuple,
-                        fps=m_fps, method=of_method,
+                        input_path=mag_path,
+                        roi=roi_tuple,
+                        fps=m_fps,          # ← always the encoding FPS now
+                        method=of_method,
                         progress_callback=_an_cb,
                     )
                     an_prog.progress(1.0)
-                    an_status.success("✅ Analysis complete!")
+                    an_status.success(f"✅ Analysis complete! (FPS used: {m_fps:.2f})")
 
                     r1, r2, r3, r4 = st.columns(4)
                     r1.metric("Dominant Freq", f"{result['dominant_hz']:.3f} Hz")
